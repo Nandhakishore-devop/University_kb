@@ -1,0 +1,34 @@
+# Core
+streamlit>=1.32.0
+python-dotenv>=1.0.0
+
+# LangChain
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0
+langchain-chroma>=0.1.0
+
+# ChromaDB
+chromadb>=0.5.0
+
+# Embeddings (local fallback)
+sentence-transformers>=2.7.0
+
+# Document Loaders
+pymupdf>=1.24.0          # PDF via fitz
+python-docx>=1.1.0       # DOCX
+beautifulsoup4>=4.12.0   # HTML
+lxml>=5.0.0
+
+# Data / Schema
+pydantic>=2.0.0
+
+# Export
+pandas>=2.2.0
+
+# LangChain Agent
+openai>=1.30.0
+
+# Utilities
+tiktoken>=0.7.0
+loguru>=0.7.0
