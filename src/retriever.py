@@ -6,6 +6,7 @@ while benefiting from our custom ChromaStore for stats and admin ops.
 """
 
 from __future__ import annotations
+import os
 from typing import List, Optional
 
 from langchain_core.documents import Document
@@ -87,3 +88,67 @@ class UniversityRetriever:
             )
             for r in records
         ]
+
+    # ------------------------------------------------------------------
+    # AI Answer (RAG)
+    # ------------------------------------------------------------------
+
+    def get_rag_answer(
+        self,
+        query: str,
+        filters: Optional[SearchFilter] = None,
+        top_k: int = 5,
+    ) -> dict:
+        """
+        Retrieve relevant chunks and generate an AI answer using RAG.
+        Returns a dict: {"answer": str, "sources": List[dict]}
+        """
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return {
+                "answer": "⚠️ RAG answering requires GROQ_API_KEY. Showing retrieved chunks only.",
+                "sources": [],
+            }
+
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import ChatPromptTemplate
+
+        # 1. Retrieve
+        records = self.search(query, filters, top_k, admin_override=False)
+        if not records:
+            return {"answer": "I couldn't find any relevant information in the knowledge base.", "sources": []}
+
+        # 2. Prepare Context
+        context_text = "\n\n".join(
+            [f"--- SOURCE: {r.metadata.get('source_file')} (Page {r.metadata.get('page_number','?')}) ---\n{r.content}" 
+             for r in records]
+        )
+
+        # 3. Generate Answer
+        llm = ChatOpenAI(
+            model="mixtral-8x7b-32768",
+            temperature=0,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key,
+        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                "You are the University Knowledge Base Assistant. "
+                "Answer the user's question based strictly on the provided context. "
+                "If the context doesn't contain the answer, say you don't know. "
+                "Cite your sources using the source filename (e.g. [handbook_2024.pdf]). "
+                "Keep the answer professional and concise."
+            )),
+            ("human", "Context:\n{context}\n\nQuestion: {question}")
+        ])
+
+        try:
+            chain = prompt | llm
+            response = chain.invoke({"context": context_text, "question": query})
+            return {
+                "answer": response.content,
+                "sources": [r.model_dump() for r in records]
+            }
+        except Exception as e:
+            logger.error(f"RAG generation failed: {e}")
+            return {"answer": f"Error generating answer: {e}", "sources": [r.model_dump() for r in records]}

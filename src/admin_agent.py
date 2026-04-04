@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from langchain.tools import StructuredTool
+from langchain_core.tools import StructuredTool
 from langchain_core.messages import SystemMessage
 from loguru import logger
 
@@ -58,12 +58,31 @@ def _upsert_doc(
         metadata = DocMetadata(**metadata_dict)
         chunks = chunk_document(file_path, metadata)
         if not chunks:
-            return f"WARNING: No text extracted from {file_path}"
+            file_ext = Path(file_path).suffix.lower()
+            if file_ext == ".pdf":
+                return (
+                    "❌ PDF Extraction Failed\n\n"
+                    "This is a scanned/image-based PDF with no selectable text.\n\n"
+                    "✅ SOLUTION 1: Enable OCR (recommended)\n"
+                    "   - See OCR_SETUP.md for detailed instructions\n"
+                    "   - pip install pytesseract Pillow\n"
+                    "   - Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki\n"
+                    "   - Re-upload the PDF (automatic OCR will process it)\n\n"
+                    "✅ SOLUTION 2: Pre-convert the PDF\n"
+                    "   - Visit: https://www.ilovepdf.com/ocr_pdf\n"
+                    "   - Upload scanned PDF → Download OCR'd PDF\n"
+                    "   - Upload the converted PDF here\n\n"
+                    "✅ SOLUTION 3: Re-export PDF\n"
+                    "   - Open source document in original format\n"
+                    "   - Export/Print as PDF with text layer"
+                )
+            else:
+                return f"❌ ERROR: No text extracted from {Path(file_path).name}. The file may be empty or corrupted."
         n = store.upsert_chunks(chunks)
-        return f"SUCCESS: Upserted {n} chunks from '{Path(file_path).name}' (v{metadata.version})"
+        return f"✅ SUCCESS: Upserted {n} chunks from '{Path(file_path).name}' (v{metadata.version})"
     except Exception as e:
         logger.error(f"upsert_doc_tool error: {e}")
-        return f"ERROR: {e}"
+        return f"❌ ERROR: {e}"
 
 
 def _delete_by_metadata(store: ChromaStore, filters: dict) -> str:
@@ -77,38 +96,106 @@ def _delete_by_metadata(store: ChromaStore, filters: dict) -> str:
 
 
 def _detect_duplicates(store: ChromaStore, new_doc_metadata: dict) -> str:
-    """Check for existing docs with same topic+department."""
+    """
+    Check for existing docs with same topic+department.
+    Also performs a semantic check if topic is provided.
+    """
     topic = new_doc_metadata.get("topic", "")
     department = new_doc_metadata.get("department", "GENERAL")
     year = int(new_doc_metadata.get("year", 0))
 
+    # 1. Metadata-based check
     existing = store.find_similar_docs(topic, department, year)
-    if not existing:
+    
+    warnings = []
+    found_metadata_dup = False
+    
+    if existing:
+        found_metadata_dup = True
+        for m in existing:
+            ex_year = m.get("year", 0)
+            ex_ver = m.get("version", "?")
+            ex_src = m.get("source_file", "?")
+            if ex_year > year:
+                warnings.append(
+                    f"NEWER VERSION EXISTS (Metadata): '{ex_src}' (year={ex_year}, v={ex_ver}) "
+                    f"is newer than the doc you're uploading (year={year})."
+                )
+            elif ex_year == year:
+                warnings.append(
+                    f"SAME YEAR CONFLICT (Metadata): '{ex_src}' (v={ex_ver}) has same year."
+                )
+            else:
+                warnings.append(
+                    f"OLDER VERSION (Metadata): '{ex_src}' (year={ex_year}, v={ex_ver}) already exists."
+                )
+
+    # 2. Semantic-based check (if topic is long enough to be a query)
+    if topic and len(topic) > 3:
+        semantic_results = store.similarity_search(query=topic, top_k=3)
+        for res in semantic_results:
+            # If high similarity (> 0.85) but different filename/topic metadata
+            if res.score > 0.85:
+                src = res.metadata.get("source_file", "?")
+                if src != new_doc_metadata.get("source_file"):
+                    warnings.append(
+                        f"SEMANTIC DUPLICATE: Content in '{src}' is very similar to your topic '{topic}' "
+                        f"(Confidence: {res.score*100:.1f}%). Please verify if this is a duplicate."
+                    )
+                    break
+
+    if not warnings:
         return "NO_DUPLICATES: No existing docs found with same topic and department."
 
-    warnings = []
-    for m in existing:
-        ex_year = m.get("year", 0)
-        ex_ver = m.get("version", "?")
-        ex_src = m.get("source_file", "?")
-        if ex_year > year:
-            warnings.append(
-                f"NEWER VERSION EXISTS: '{ex_src}' (year={ex_year}, v={ex_ver}) "
-                f"is newer than the doc you're uploading (year={year}). "
-                "Consider whether you really need to add this older version."
-            )
-        elif ex_year == year:
-            warnings.append(
-                f"SAME YEAR CONFLICT: '{ex_src}' (v={ex_ver}) has same year. "
-                "Upserting will overwrite if same version."
-            )
-        else:
-            warnings.append(
-                f"OLDER VERSION: '{ex_src}' (year={ex_year}, v={ex_ver}) already exists. "
-                "You may want to delete it after uploading the new version."
-            )
-
     return "\n".join(warnings)
+
+
+def _detect_conflicts(store: ChromaStore, topic: str) -> str:
+    """
+    Retrieve chunks for a topic and ask an LLM to identify any 
+    contradictory information (e.g. different dates/rules for the same thing).
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return "ERROR: Conflict detection requires GROQ_API_KEY."
+
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+
+    # 1. Retrieve everything for this topic
+    results = store.similarity_search(query=topic, top_k=15)
+    if len(results) < 2:
+        return "NO_CONFLICTS: Not enough documents in the KB for this topic to compare."
+
+    # 2. Prepare for LLM
+    context_text = "\n\n".join(
+        [f"--- {r.metadata.get('source_file')} (v{r.metadata.get('version')}, Year {r.metadata.get('year')}) ---\n{r.content}" 
+         for r in results]
+    )
+
+    llm = ChatOpenAI(
+        model="mixtral-8x7b-32768",
+        temperature=0,
+        base_url="https://api.groq.com/openai/v1",
+        api_key=api_key,
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are a Conflict Detection Assistant. "
+            "Your task is to identify contradictory information in the provided university documents. "
+            "Look for inconsistencies in dates, rules, eligibility, or policies for the same topic. "
+            "If no conflicts are found, say 'NO_CONFLICTS_FOUND'. "
+            "If conflicts are found, list them clearly with the source document names."
+        )),
+        ("human", "Topic: {topic}\n\nDocuments:\n{context}")
+    ])
+
+    try:
+        chain = prompt | llm
+        response = chain.invoke({"context": context_text, "topic": topic})
+        return response.content
+    except Exception as e:
+        return f"ERROR: Conflict detection failed: {e}"
 
 
 def _recommend_reindex(store: ChromaStore) -> str:
@@ -159,7 +246,7 @@ class AdminAgent:
     """
     Provides LangChain StructuredTools for KB management.
 
-    If OPENAI_API_KEY is set, also builds a ReAct agent that can chain
+    If GROK_API_KEY is set, also builds a ReAct agent that can chain
     tool calls based on natural-language admin instructions.
     """
 
@@ -222,7 +309,16 @@ class AdminAgent:
             description="Analyse KB health and recommend re-indexing or cleanup actions.",
         )
 
-        return [kb_stats, upsert_doc, delete_meta, detect_dups, reindex]
+        detect_conflicts = StructuredTool.from_function(
+            func=lambda topic: _detect_conflicts(store, topic),
+            name="detect_conflicts_tool",
+            description=(
+                "Check for contradictory information (conflicts) within a topic. "
+                "Args: topic (str)."
+            ),
+        )
+
+        return [kb_stats, upsert_doc, delete_meta, detect_dups, reindex, detect_conflicts]
 
     # ------------------------------------------------------------------
     # Direct tool calls (no LLM required)
@@ -240,6 +336,9 @@ class AdminAgent:
     def detect_duplicates(self, metadata_dict: dict) -> str:
         return _detect_duplicates(self._store, metadata_dict)
 
+    def detect_conflicts(self, topic: str) -> str:
+        return _detect_conflicts(self._store, topic)
+
     def recommend_reindex(self) -> str:
         return _recommend_reindex(self._store)
 
@@ -248,15 +347,15 @@ class AdminAgent:
         return suggest_metadata_from_filename(filename)
 
     # ------------------------------------------------------------------
-    # LLM agent (optional — requires OPENAI_API_KEY)
+    # LLM agent (optional — requires GROK_API_KEY)
     # ------------------------------------------------------------------
 
     def _get_llm_agent(self):
-        """Lazy-init a ReAct agent backed by GPT-4o-mini."""
+        """Lazy-init a ReAct agent backed by Grok-2."""
         if self._agent:
             return self._agent
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = os.getenv("GROK_API_KEY")
         if not api_key:
             return None
 
@@ -265,7 +364,12 @@ class AdminAgent:
             from langchain.agents import create_tool_calling_agent, AgentExecutor
             from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
+            llm = ChatOpenAI(
+                model="grok-2",
+                temperature=0,
+                base_url="https://api.x.ai/v1",
+                api_key=api_key,
+            )
 
             prompt = ChatPromptTemplate.from_messages(
                 [
@@ -291,7 +395,7 @@ class AdminAgent:
                 handle_parsing_errors=True,
                 max_iterations=8,
             )
-            logger.info("LLM Admin Agent initialised (GPT-4o-mini)")
+            logger.info("LLM Admin Agent initialised (Grok-2)")
             return self._agent
 
         except Exception as e:
@@ -306,7 +410,7 @@ class AdminAgent:
         agent = self._get_llm_agent()
         if agent is None:
             return (
-                "⚠️ LLM Admin Agent requires OPENAI_API_KEY to be set. "
+                "⚠️ LLM Admin Agent requires GROK_API_KEY to be set. "
                 "You can still use the manual Admin Panel tools above."
             )
         try:

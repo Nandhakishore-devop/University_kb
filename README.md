@@ -11,11 +11,13 @@ and policy documents — built with **ChromaDB**, **LangChain**, and **Streamlit
 |---|---|
 | **Document Ingestion** | PDF (PyMuPDF), DOCX (python-docx), HTML (BeautifulSoup4) |
 | **Vector Store** | ChromaDB persistent on disk with upsert/delete |
-| **Embeddings** | OpenAI `text-embedding-3-small` (if key set) or local `all-MiniLM-L6-v2` |
+| **Embeddings** | Grok (xAI) `text-embedding-3-small` (if key set) or local `all-MiniLM-L6-v2` |
 | **Chunking** | LangChain `RecursiveCharacterTextSplitter` |
 | **Metadata Filtering** | Topic, year, department, access, doc type, version |
 | **Access Control** | Students see only `public` docs; admins see all |
-| **Admin Agent** | LangChain tool-calling agent (GPT-4o-mini) for KB management |
+| **Admin Agent** | LangChain tool-calling agent (Grok-2) for KB management |
+| **Conflict Detection** | LLM analysis identifies contradictory information across documents |
+| **RAG Answers** | Retrieval-Augmented Generation for student questions |
 | **Student UI** | Similarity search with metadata cards and score badges |
 | **Admin UI** | Ingest, delete, export, stats, duplicate detection |
 | **Export** | JSON and CSV metadata backup download |
@@ -78,20 +80,28 @@ pip install -r requirements.txt
 ```
 
 > **Note:** `sentence-transformers` downloads a ~90MB model on first run (local embeddings).
-> If you have an OpenAI key, the download is skipped.
+> If you have a Grok API key, embeddings will be faster via xAI.
 
-### 4. (Optional) Set OpenAI API key
+### 4. (Optional) Set Grok API key
+
+The app works perfectly without a Grok API key using local embeddings. However, to enable:
+- **AI Admin Agent** (manage KB with natural language)
+- **Conflict Detection** (identify contradictory information)
+- **RAG Answers** (AI-powered student answers with citations)
+- **Grok Embeddings** (faster semantic search)
+
+Get a Grok API key from [xAI Console](https://console.x.ai/):
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env and add your GROK_API_KEY (starts with xai-...)
 ```
 
 Or set it directly:
 
 ```bash
-export OPENAI_API_KEY=sk-...   # Linux/macOS
-set OPENAI_API_KEY=sk-...      # Windows
+export GROK_API_KEY=xai-...      # Linux/macOS
+set GROK_API_KEY=xai-...         # Windows
 ```
 
 ### 5. Generate sample documents
@@ -153,7 +163,7 @@ Open your browser to **http://localhost:8501**.
 
 ### Admin AI Agent Tab
 
-Requires `OPENAI_API_KEY`. Chat with the agent:
+Requires `GROK_API_KEY`. Chat with the agent:
 
 ```
 > Show me KB statistics
@@ -185,7 +195,7 @@ class DocMetadata(BaseModel):
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | None | Enables OpenAI embeddings + AI Agent |
+| `GROK_API_KEY` | None | Enables Grok embeddings, AI Agent, conflict detection, RAG answers |
 | `CHROMA_DIR` | `./chroma_db` | ChromaDB persistence directory |
 | `CHUNK_SIZE` | 800 | Characters per chunk |
 | `CHUNK_OVERLAP` | 150 | Overlap between chunks |
@@ -196,7 +206,7 @@ class DocMetadata(BaseModel):
 
 | Mode | Model | Notes |
 |---|---|---|
-| **OpenAI** | `text-embedding-3-small` | Requires API key; fast; costs ~$0.02/1M tokens |
+| **Grok (xAI)** | `text-embedding-3-small` via xAI API | Requires API key; fast; integrate with Grok-2 agents |
 | **Local** | `all-MiniLM-L6-v2` | No key needed; ~90MB download; runs on CPU |
 
 ---

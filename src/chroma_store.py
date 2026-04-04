@@ -26,19 +26,20 @@ def _get_embedding_function(use_openai: bool = False):
     """Return an embedding function compatible with ChromaDB's raw client.
 
     Priority:
-      1. OpenAI (if use_openai=True and OPENAI_API_KEY set)
+      1. Grok (if use_openai=True and GROK_API_KEY set)
       2. sentence-transformers local model (always available)
     """
-    if use_openai and os.getenv("OPENAI_API_KEY"):
+    if use_openai and os.getenv("GROK_API_KEY"):
         try:
             from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-            logger.info("Using OpenAI embeddings")
+            logger.info("Using Grok embeddings (xAI)")
             return OpenAIEmbeddingFunction(
-                api_key=os.getenv("OPENAI_API_KEY"),
+                api_key=os.getenv("GROK_API_KEY"),
                 model_name="text-embedding-3-small",
+                api_base="https://api.x.ai/v1",
             )
         except Exception as e:
-            logger.warning(f"OpenAI embedding init failed ({e}); falling back to local")
+            logger.warning(f"Grok embedding init failed ({e}); falling back to local")
 
     # Local sentence-transformers fallback
     try:
@@ -73,11 +74,37 @@ class ChromaStore:
             path=self._persist_dir,
             settings=Settings(anonymized_telemetry=False),
         )
-        self._collection = self._client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=self._embed_fn,
-            metadata={"hnsw:space": "cosine"},
-        )
+        
+        # Handle embedding function conflicts by deleting and recreating collection
+        try:
+            self._collection = self._client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=self._embed_fn,
+                metadata={"hnsw:space": "cosine"},
+            )
+        except ValueError as e:
+            if "embedding function" in str(e).lower():
+                logger.warning(
+                    f"Embedding function conflict detected: {e}. "
+                    f"Deleting and recreating collection with new embedding function."
+                )
+                # Delete the old collection
+                try:
+                    self._client.delete_collection(name=COLLECTION_NAME)
+                    logger.info(f"Deleted old collection '{COLLECTION_NAME}'")
+                except Exception as del_err:
+                    logger.warning(f"Could not delete collection: {del_err}")
+                
+                # Create new collection with new embedding function
+                self._collection = self._client.get_or_create_collection(
+                    name=COLLECTION_NAME,
+                    embedding_function=self._embed_fn,
+                    metadata={"hnsw:space": "cosine"},
+                )
+                logger.info(f"Created new collection '{COLLECTION_NAME}' with {self._embed_fn.name() if hasattr(self._embed_fn, 'name') else 'custom'} embedding")
+            else:
+                raise
+        
         logger.info(
             f"ChromaStore ready — collection '{COLLECTION_NAME}' "
             f"({self._collection.count()} chunks) at {self._persist_dir}"

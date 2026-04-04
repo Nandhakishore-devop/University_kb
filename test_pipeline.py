@@ -15,6 +15,10 @@ Tests:
 from __future__ import annotations
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Ensure project root is in path
 sys.path.insert(0, str(Path(__file__).parent))
