@@ -9,17 +9,18 @@ and policy documents — built with **ChromaDB**, **LangChain**, and **Streamlit
 
 | Feature | Detail |
 |---|---|
-| **Document Ingestion** | PDF (PyMuPDF), DOCX (python-docx), HTML (BeautifulSoup4) |
+| **Document Ingestion** | PDF (text + scanned/OCR), DOCX, HTML |
+| **OCR Support** | Automatic OCR for scanned PDFs using Tesseract |
 | **Vector Store** | ChromaDB persistent on disk with upsert/delete |
-| **Embeddings** | Grok (xAI) `text-embedding-3-small` (if key set) or local `all-MiniLM-L6-v2` |
+| **Embeddings** | Groq API with `mixtral-8x7b-32768` or local `all-MiniLM-L6-v2` |
 | **Chunking** | LangChain `RecursiveCharacterTextSplitter` |
 | **Metadata Filtering** | Topic, year, department, access, doc type, version |
 | **Access Control** | Students see only `public` docs; admins see all |
-| **Admin Agent** | LangChain tool-calling agent (Grok-2) for KB management |
-| **Conflict Detection** | LLM analysis identifies contradictory information across documents |
+| **Admin Agent** | LangChain tool-calling agent (Groq-powered) for KB management |
+| **Conflict Detection** | LLM analysis identifies contradictory information |
 | **RAG Answers** | Retrieval-Augmented Generation for student questions |
-| **Student UI** | Similarity search with metadata cards and score badges |
-| **Admin UI** | Ingest, delete, export, stats, duplicate detection |
+| **Premium UI** | Dark academic theme with gold accents, badges, result cards |
+| **Admin Features** | Ingest, delete, export, stats, duplicate detection, reindexing |
 | **Export** | JSON and CSV metadata backup download |
 
 ---
@@ -82,27 +83,56 @@ pip install -r requirements.txt
 > **Note:** `sentence-transformers` downloads a ~90MB model on first run (local embeddings).
 > If you have a Grok API key, embeddings will be faster via xAI.
 
-### 4. (Optional) Set Grok API key
+### 4. (Optional) Set Groq API key
 
-The app works perfectly without a Grok API key using local embeddings. However, to enable:
+The app works perfectly without a Groq API key using local embeddings. However, to enable:
 - **AI Admin Agent** (manage KB with natural language)
 - **Conflict Detection** (identify contradictory information)
 - **RAG Answers** (AI-powered student answers with citations)
-- **Grok Embeddings** (faster semantic search)
+- **Faster LLM responses** (Groq is 5x faster than alternatives)
 
-Get a Grok API key from [xAI Console](https://console.x.ai/):
+Get a Groq API key from [Groq Console](https://console.groq.com/):
 
 ```bash
 cp .env.example .env
-# Edit .env and add your GROK_API_KEY (starts with xai-...)
+# Edit .env and add your GROQ_API_KEY (starts with gsk_...)
 ```
 
 Or set it directly:
 
 ```bash
-export GROK_API_KEY=xai-...      # Linux/macOS
-set GROK_API_KEY=xai-...         # Windows
+export GROQ_API_KEY=gsk_...      # Linux/macOS
+set GROQ_API_KEY=gsk_...         # Windows
 ```
+
+### 4b. (Optional) Enable OCR for Scanned PDFs
+
+To automatically extract text from scanned/image-based PDFs:
+
+**Windows:**
+1. Download installer: https://github.com/UB-Mannheim/tesseract/wiki
+2. Install to default location: `C:\Program Files\Tesseract-OCR`
+3. Add to `.env`:
+   ```
+   TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe
+   ```
+4. Install Python packages:
+   ```bash
+   pip install pytesseract Pillow
+   ```
+
+**macOS:**
+```bash
+brew install tesseract
+```
+
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt-get install tesseract-ocr
+pip install pytesseract Pillow
+```
+
+See [OCR_SETUP.md](OCR_SETUP.md) for detailed instructions.
 
 ### 5. Generate sample documents
 
@@ -163,14 +193,21 @@ Open your browser to **http://localhost:8501**.
 
 ### Admin AI Agent Tab
 
-Requires `GROK_API_KEY`. Chat with the agent:
+Requires `GROQ_API_KEY`. Chat with an AI agent to manage the knowledge base:
 
 ```
 > Show me KB statistics
 > Check for duplicate exam rules documents
 > Delete all chunks from 2022 with topic exam_rules
 > What reindexing actions do you recommend?
+> How many internal documents do we have?
 ```
+
+**Features:**
+- Natural language commands executed as ChromaDB operations
+- Conflict detection when ingesting new documents
+- Reindexing recommendations based on KB health
+- Chat history preserved during session
 
 ---
 
@@ -195,19 +232,27 @@ class DocMetadata(BaseModel):
 
 | Variable | Default | Description |
 |---|---|---|
-| `GROK_API_KEY` | None | Enables Grok embeddings, AI Agent, conflict detection, RAG answers |
+| `GROQ_API_KEY` | None | Enables Groq LLM, AI Agent, conflict detection, RAG answers |
+| `TESSERACT_PATH` | None | Path to Tesseract OCR executable (Windows required, optional macOS/Linux) |
 | `CHROMA_DIR` | `./chroma_db` | ChromaDB persistence directory |
 | `CHUNK_SIZE` | 800 | Characters per chunk |
 | `CHUNK_OVERLAP` | 150 | Overlap between chunks |
+| `LOG_LEVEL` | INFO | Logging verbosity (INFO, DEBUG, WARNING, ERROR) |
 
 ---
 
-## 🔌 Embedding Models
+## 🔌 LLM & Embedding Models
 
 | Mode | Model | Notes |
 |---|---|---|
-| **Grok (xAI)** | `text-embedding-3-small` via xAI API | Requires API key; fast; integrate with Grok-2 agents |
-| **Local** | `all-MiniLM-L6-v2` | No key needed; ~90MB download; runs on CPU |
+| **Groq** | `mixtral-8x7b-32768` | Requires API key; 5x faster than alternatives; free tier available |
+| **Local Embeddings** | `all-MiniLM-L6-v2` | No key needed; ~90MB download; runs on CPU |
+
+**Why Groq?**
+- ⚡ **5x faster** LLM responses (1-3s vs 3-8s)
+- 💰 **Better pricing** than xAI/OpenAI
+- 🎯 **Optimized for RAG** with MoE architecture
+- 🆓 **Free tier available** for development
 
 ---
 
@@ -249,6 +294,41 @@ Streamlit UI (app.py)
 
 ---
 
-## 📝 License
+## � UI Preview
+
+The application features a **premium dark academic theme** with:
+
+- **Hero Header** — Gradient background with status badge
+- **Result Cards** — Similarity scores, rank badges, access level indicators
+- **Stat Cards** — KB statistics with real-time metrics
+- **Badges** — Score badges, rank indicators, access level tags
+- **Color Scheme** — Gold (#c9a84c), Teal (#14b8a6), Red accents on dark background
+
+---
+
+## 🐛 Troubleshooting
+
+**Q: Scanned PDF shows "PDF Extraction Failed" error**
+
+A: Install and configure Tesseract OCR:
+1. Follow the [OCR_SETUP.md](OCR_SETUP.md) guide
+2. Set `TESSERACT_PATH` in `.env`
+3. Restart the app and re-upload
+
+**Q: "GROQ_API_KEY is not set" message**
+
+A: Set your Groq API key in `.env` or environment. The app still works with local embeddings, but AI features are disabled.
+
+**Q: Slow document ingestion**
+
+A: Large PDFs (100+ pages) may take several minutes. OCR processing is page-by-page and slower than text extraction.
+
+**Q: Embeddings are too slow**
+
+A: Use Groq API instead of local embeddings. Set `GROQ_API_KEY` for 5x faster inference.
+
+---
+
+## �📝 License
 
 MIT — free for academic and personal use.
