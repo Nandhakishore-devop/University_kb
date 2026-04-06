@@ -28,8 +28,28 @@ from src.schemas import DocMetadata, SearchFilter
 from src.utils import suggest_metadata_from_filename
 
 
-# ---------------------------------------------------------------------------
-# Tool implementations (plain functions, wrapped below)
+def _get_groq_model(api_key: str) -> str:
+    """Get the Groq model to use.
+    
+    Priority:
+    1. GROQ_MODEL environment variable (if set)
+    2. Default to current recommended model
+    
+    Available models: Check https://console.groq.com/docs/models
+    """
+    # Check for user-configured model
+    configured_model = os.getenv("GROQ_MODEL")
+    if configured_model:
+        return configured_model
+    
+    # Updated model (check console.groq.com for latest)
+    # As of 2026, commonly available models include:
+    # - llama-3.3-70b-versatile
+    # - llama-3.1-405b-reasoning  
+    # - gemma-2-9b-it
+    return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -157,40 +177,41 @@ def _detect_conflicts(store: ChromaStore, topic: str) -> str:
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "ERROR: Conflict detection requires GROQ_API_KEY."
-
-    from langchain_openai import ChatOpenAI
-    from langchain_core.prompts import ChatPromptTemplate
-
-    # 1. Retrieve everything for this topic
-    results = store.similarity_search(query=topic, top_k=15)
-    if len(results) < 2:
-        return "NO_CONFLICTS: Not enough documents in the KB for this topic to compare."
-
-    # 2. Prepare for LLM
-    context_text = "\n\n".join(
-        [f"--- {r.metadata.get('source_file')} (v{r.metadata.get('version')}, Year {r.metadata.get('year')}) ---\n{r.content}" 
-         for r in results]
-    )
-
-    llm = ChatOpenAI(
-        model="mixtral-8x7b-32768",
-        temperature=0,
-        base_url="https://api.groq.com/openai/v1",
-        api_key=api_key,
-    )
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", (
-            "You are a Conflict Detection Assistant. "
-            "Your task is to identify contradictory information in the provided university documents. "
-            "Look for inconsistencies in dates, rules, eligibility, or policies for the same topic. "
-            "If no conflicts are found, say 'NO_CONFLICTS_FOUND'. "
-            "If conflicts are found, list them clearly with the source document names."
-        )),
-        ("human", "Topic: {topic}\n\nDocuments:\n{context}")
-    ])
+        return "ERROR: Conflict detection requires GROQ_API_KEY to be set in .env file."
 
     try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import ChatPromptTemplate
+
+        # 1. Retrieve everything for this topic
+        results = store.similarity_search(query=topic, top_k=15)
+        if len(results) < 2:
+            return "NO_CONFLICTS: Not enough documents in the KB for this topic to compare."
+
+        # 2. Prepare for LLM
+        context_text = "\n\n".join(
+            [f"--- {r.metadata.get('source_file')} (v{r.metadata.get('version')}, Year {r.metadata.get('year')}) ---\n{r.content}" 
+             for r in results]
+        )
+
+        llm = ChatOpenAI(
+            model="mixtral-8x7b-32768",
+            temperature=0.0,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key,
+        )
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                "You are a Conflict Detection Assistant. "
+                "Your task is to identify contradictory information in the provided university documents. "
+                "Look for inconsistencies in dates, rules, eligibility, or policies for the same topic. "
+                "If no conflicts are found, say 'NO_CONFLICTS_FOUND'. "
+                "If conflicts are found, list them clearly with the source document names."
+            )),
+            ("human", "Topic: {topic}\n\nDocuments:\n{context}")
+        ])
+
         chain = prompt | llm
         response = chain.invoke({"context": context_text, "topic": topic})
         return response.content
@@ -351,55 +372,76 @@ class AdminAgent:
     # ------------------------------------------------------------------
 
     def _get_llm_agent(self):
-        """Lazy-init a ReAct agent backed by Grok-2."""
+        """Lazy-init a ReAct agent backed by Mixtral via Groq."""
         if self._agent:
             return self._agent
 
-        api_key = os.getenv("GROK_API_KEY")
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
+            logger.warning("GROQ_API_KEY not set in .env file. LLM Admin Agent will not be available.")
             return None
 
         try:
             from langchain_openai import ChatOpenAI
-            from langchain.agents import create_tool_calling_agent, AgentExecutor
+            from langchain.agents import AgentExecutor
             from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+            from langgraph.prebuilt import create_react_agent
 
+            model = _get_groq_model(api_key)
+            
             llm = ChatOpenAI(
-                model="grok-2",
-                temperature=0,
-                base_url="https://api.x.ai/v1",
+                model=model,
+                temperature=0.0,
+                base_url="https://api.groq.com/openai/v1",
                 api_key=api_key,
             )
 
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    SystemMessage(
-                        content=(
-                            "You are the University Knowledge Base Admin Assistant. "
-                            "You help administrators manage university documents stored in ChromaDB. "
-                            "Always check for duplicates before upserting. "
-                            "Require explicit confirmation before any deletion. "
-                            "Suggest metadata based on filenames when not provided."
-                        )
-                    ),
-                    ("human", "{input}"),
-                    MessagesPlaceholder("agent_scratchpad"),
-                ]
+            # System prompt
+            system_prompt = (
+                "You are the University Knowledge Base Admin Assistant. "
+                "You help administrators manage university documents stored in ChromaDB. "
+                "Available tools:\n"
+                "  • kb_stats_tool: Get KB statistics\n"
+                "  • upsert_doc_tool: Ingest/update a document\n"
+                "  • delete_by_metadata_tool: Delete chunks by filter\n"
+                "  • detect_duplicates_tool: Find duplicate documents\n"
+                "  • detect_conflicts_tool: Find contentual conflicts\n"
+                "  • recommend_reindex_tool: Get system recommendations\n"
+                "Always check for duplicates before upserting. "
+                "Require explicit confirmation before any deletion. "
+                "Suggest metadata based on filenames when not provided."
             )
 
-            agent = create_tool_calling_agent(llm, self.tools, prompt)
-            self._agent = AgentExecutor(
-                agent=agent,
-                tools=self.tools,
-                verbose=True,
-                handle_parsing_errors=True,
-                max_iterations=8,
-            )
-            logger.info("LLM Admin Agent initialised (Grok-2)")
+            # Create agent using LangGraph (more modern approach)
+            self._agent = create_react_agent(llm, self.tools, state_modifier=system_prompt)
+            logger.info("✅ LLM Admin Agent initialised (Mixtral-8x7b via Groq)")
             return self._agent
 
+        except ImportError:
+            # Fallback: use simple LLM-Tools binding
+            try:
+                from langchain_openai import ChatOpenAI
+                
+                model = _get_groq_model(api_key)
+                
+                llm = ChatOpenAI(
+                    model=model,
+                    temperature=0.0,
+                    base_url="https://api.groq.com/openai/v1",
+                    api_key=api_key,
+                )
+                
+                # Bind tools to LLM
+                self._agent = llm.bind_tools(self.tools)
+                logger.info("✅ LLM Admin Agent initialised (tool-binding mode)")
+                return self._agent
+                
+            except Exception as e2:
+                logger.error(f"Could not init LLM agent (fallback also failed): {e2}")
+                return None
+                
         except Exception as e:
-            logger.warning(f"Could not init LLM agent: {e}")
+            logger.error(f"Could not init LLM agent: {e}")
             return None
 
     def run(self, instruction: str) -> str:
@@ -410,12 +452,34 @@ class AdminAgent:
         agent = self._get_llm_agent()
         if agent is None:
             return (
-                "⚠️ LLM Admin Agent requires GROK_API_KEY to be set. "
-                "You can still use the manual Admin Panel tools above."
+                "⚠️ LLM Admin Agent requires GROQ_API_KEY to be set in .env file.\n\n"
+                "✅ To enable:\n"
+                "  1. Go to https://console.groq.com\n"
+                "  2. Create an API key\n"
+                "  3. Add to .env: GROQ_API_KEY=your_key_here\n"
+                "  4. Restart the app\n\n"
+                "💡 You can still use the manual Admin Panel tools below without the LLM."
             )
         try:
-            result = agent.invoke({"input": instruction})
-            return result.get("output", str(result))
+            from langchain_core.messages import HumanMessage
+            
+            # Handle tool-bound LLM (simple invoke)
+            if hasattr(agent, 'bind_tools'):
+                response = agent.invoke([HumanMessage(content=instruction)])
+                if hasattr(response, 'content'):
+                    return response.content
+                return str(response)
+            
+            # Handle ReAct agent (needs dict input)
+            elif hasattr(agent, 'invoke'):
+                result = agent.invoke({"input": instruction})
+                if isinstance(result, dict):
+                    return result.get("output", str(result))
+                return str(result)
+            else:
+                return "Error: Unknown agent type"
         except Exception as e:
             logger.error(f"Agent run failed: {e}")
+            import traceback
+            traceback.print_exc()
             return f"Agent error: {e}"
