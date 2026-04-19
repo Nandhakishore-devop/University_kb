@@ -131,6 +131,25 @@ class ChromaStore:
         logger.info(f"Upserted {len(chunks)} chunks")
         return len(chunks)
 
+    def update_metadata(self, ids: List[str], updates: dict) -> int:
+        """Update metadata for existing chunks without re-embedding."""
+        if not ids:
+            return 0
+        
+        # Fetch current metadata
+        result = self._collection.get(ids=ids, include=["metadatas"])
+        current_metas = result.get("metadatas", [])
+        
+        # Apply updates
+        new_metas = []
+        for meta in current_metas:
+            updated = {**meta, **updates}
+            new_metas.append(updated)
+        
+        self._collection.update(ids=ids, metadatas=new_metas)
+        logger.info(f"Updated metadata for {len(ids)} chunks")
+        return len(ids)
+
     def delete_by_filter(self, search_filter: SearchFilter) -> int:
         """Delete all chunks matching the given filter. Returns deleted count.
 
@@ -221,12 +240,27 @@ class ChromaStore:
 
         doc_type_counts: dict[str, int] = {}
         years = []
+        verified_count = 0
+        archived_count = 0
+        contributors = set()
+
         for m in all_meta:
             dt = m.get("doc_type", "other")
             doc_type_counts[dt] = doc_type_counts.get(dt, 0) + 1
+            
             y = m.get("year", 0)
             if y:
                 years.append(y)
+            
+            if m.get("verification_status") == "verified":
+                verified_count += 1
+            
+            if m.get("is_archived") is True:
+                archived_count += 1
+            
+            c_id = m.get("contributor_id")
+            if c_id:
+                contributors.add(c_id)
 
         year_range = (min(years), max(years)) if years else (0, 0)
 
@@ -237,6 +271,9 @@ class ChromaStore:
             unique_departments=departments,
             doc_type_counts=doc_type_counts,
             year_range=year_range,
+            verified_chunks=verified_count,
+            unique_contributors=len(contributors),
+            archived_chunks=archived_count,
         )
 
     def count(self) -> int:

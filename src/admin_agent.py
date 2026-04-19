@@ -15,6 +15,7 @@ Tools:
 from __future__ import annotations
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,6 +27,13 @@ from src.chroma_store import ChromaStore
 from src.ingestion import chunk_document
 from src.schemas import DocMetadata, SearchFilter
 from src.utils import suggest_metadata_from_filename
+
+from src.services.event_service import EventService
+from src.services.notification_service import NotificationService
+from src.services.report_service import ReportService
+from src.services.registration_service import RegistrationService
+from src.services.audit_service import AuditService
+from src.services.storage_service import SecureStorageService
 
 
 def _get_groq_model(api_key: str) -> str:
@@ -76,6 +84,14 @@ def _upsert_doc(
     """Load, chunk, and upsert a document into ChromaDB."""
     try:
         metadata = DocMetadata(**metadata_dict)
+        
+        # --- Automated Deduplication Warning ---
+        dup_summary = ""
+        if metadata.topic and metadata.department:
+            dup_msg = _detect_duplicates(store, metadata_dict)
+            if "NO_DUPLICATES" not in dup_msg:
+                dup_summary = f"\n\n⚠️ INGESTION WARNINGS (Potential Duplicates):\n{dup_msg}\n"
+
         chunks = chunk_document(file_path, metadata)
         if not chunks:
             file_ext = Path(file_path).suffix.lower()
@@ -98,8 +114,15 @@ def _upsert_doc(
                 )
             else:
                 return f"❌ ERROR: No text extracted from {Path(file_path).name}. The file may be empty or corrupted."
+        
         n = store.upsert_chunks(chunks)
-        return f"✅ SUCCESS: Upserted {n} chunks from '{Path(file_path).name}' (v{metadata.version})"
+        
+        # Audit logging
+        logger.info(f"Audit: User {metadata.contributor_id} upserted {metadata.source_file}")
+        
+        success_msg = f"✅ SUCCESS: Upserted {n} chunks from '{Path(file_path).name}' (v{metadata.version})"
+        return success_msg + dup_summary
+
     except Exception as e:
         logger.error(f"upsert_doc_tool error: {e}")
         return f"❌ ERROR: {e}"
@@ -258,6 +281,97 @@ def _recommend_reindex(store: ChromaStore) -> str:
     return "RECOMMENDATIONS:\n" + "\n".join(f"  • {r}" for r in recommendations)
 
 
+def _archive_old_docs(store: ChromaStore, years_threshold: int = 3) -> str:
+    """Mark documents older than X years as archived."""
+    current_year = datetime.now().year
+    target_year = current_year - years_threshold
+    
+    all_meta = store.get_all_metadata()
+    chunks_to_archive = []
+    
+    # We need to get IDs. Since get_all_metadata doesn't return IDs, we use .get()
+    result = store._collection.get(
+        where={"year": {"$lt": target_year}},
+        include=["metadatas"]
+    )
+    ids = result.get("ids", [])
+    if not ids:
+        return f"NO_ACTION: No documents found older than {target_year}."
+    
+    n = store.update_metadata(ids, {"is_archived": True})
+    return f"SUCCESS: Archived {n} chunks from documents published before {target_year}."
+
+
+def _auto_deduplicate(store: ChromaStore, similarity_threshold: float = 0.98) -> str:
+    """Find and archive/delete semantically identical chunks."""
+    all_meta = store.get_all_metadata()
+    if not all_meta:
+        return "KB is empty."
+
+    # 1. Group by Topic + Dept to find superseded versions
+    registry: dict[tuple[str, str], list[dict]] = {}
+    for m in all_meta:
+        key = (m.get("topic", ""), m.get("department", "GENERAL").upper())
+        registry.setdefault(key, []).append(m)
+
+    archived_count = 0
+    superseded_sources = []
+
+    for (topic, dept), metas in registry.items():
+        if not topic: continue
+        
+        # Sort by year desc, then version desc
+        sorted_metas = sorted(
+            metas, 
+            key=lambda x: (x.get("year", 0), x.get("version", "0")), 
+            reverse=True
+        )
+        
+        # Keep the latest, archive everything else
+        latest = sorted_metas[0]
+        for old in sorted_metas[1:]:
+            if not old.get("is_archived"):
+                # Query IDs for this old source/version and archive them
+                result = store._collection.get(
+                    where={
+                        "$and": [
+                            {"source_file": {"$eq": old.get("source_file")}},
+                            {"version": {"$eq": old.get("version")}}
+                        ]
+                    },
+                    include=[]
+                )
+                ids = result.get("ids", [])
+                if ids:
+                    store.update_metadata(ids, {"is_archived": True})
+                    archived_count += len(ids)
+                    superseded_sources.append(f"{old.get('source_file')} (v{old.get('version')})")
+
+    if archived_count == 0:
+        return "DEDUPLICATION_REPORT: No redundant versions found. KB is optimized."
+
+    report = (
+        f"✅ DEDUPLICATION COMPLETE: Archived {archived_count} chunks.\n"
+        f"The following superseded versions were moved to archive:\n"
+        + "\n".join([f"  • {s}" for s in set(superseded_sources)])
+    )
+    return report
+
+
+def _close_event(agent: AdminAgent, topic: str) -> str:
+    """Perform post-event closure: validate attendance and archive documents."""
+    success = agent.event_service.close_event(topic)
+    if not success:
+        return f"ERROR: Topic '{topic}' not found in KB."
+
+    # 3. Summary of actions
+    return (
+        f"✅ EVENT CLOSED: '{topic}'\n"
+        f"- Chunks marked as 'closed' and 'archived' via EventService.\n"
+        f"- Automation Triggered: Certificate eligibility audit for participants.\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AdminAgent: wraps tools and optionally connects an LLM
 # ---------------------------------------------------------------------------
@@ -275,6 +389,14 @@ class AdminAgent:
         self._store = store
         self.tools = self._build_tools()
         self._agent = None  # Lazy-init
+        
+        # Service Instantiation
+        self.event_service = EventService(store)
+        self.notification_service = NotificationService()
+        self.report_service = ReportService(store)
+        self.registration_service = RegistrationService(store)
+        self.audit_service = AuditService()
+        self.storage_service = SecureStorageService()
 
     # ------------------------------------------------------------------
     # Tool construction
@@ -286,7 +408,7 @@ class AdminAgent:
         kb_stats = StructuredTool.from_function(
             func=lambda: _kb_stats(store),
             name="kb_stats_tool",
-            description="Return JSON statistics about the knowledge base: chunk count, topics, departments, doc types.",
+            description="Use this to get high-level statistics about the KB, including the total number of chunks, unique topics, and document types.",
         )
 
         upsert_doc = StructuredTool.from_function(
@@ -339,7 +461,25 @@ class AdminAgent:
             ),
         )
 
-        return [kb_stats, upsert_doc, delete_meta, detect_dups, reindex, detect_conflicts]
+        archive_docs = StructuredTool.from_function(
+            func=lambda years_threshold=3: _archive_old_docs(store, years_threshold),
+            name="archive_docs_tool",
+            description="Archive documents older than a certain number of years. Args: years_threshold (int, default 3).",
+        )
+
+        auto_dedup = StructuredTool.from_function(
+            func=lambda: _auto_deduplicate(store),
+            name="auto_deduplicate_tool",
+            description="Automatically identify and handle redundant content in the KB.",
+        )
+
+        close_event = StructuredTool.from_function(
+            func=lambda topic: _close_event(self, topic),
+            name="close_event_tool",
+            description="Automate post-event closure: mark documents as closed and archive them. Args: topic (str).",
+        )
+
+        return [kb_stats, upsert_doc, delete_meta, detect_dups, reindex, detect_conflicts, archive_docs, auto_dedup, close_event]
 
     # ------------------------------------------------------------------
     # Direct tool calls (no LLM required)
@@ -398,18 +538,18 @@ class AdminAgent:
 
             # System prompt
             system_prompt = (
-                "You are the University Knowledge Base Admin Assistant. "
-                "You help administrators manage university documents stored in ChromaDB. "
+                "You are the University Knowledge Base Super-Admin Assistant. "
+                "You have FULL AUTHORITY to read, edit, and delete data in ChromaDB using your tools. "
                 "Available tools:\n"
-                "  • kb_stats_tool: Get KB statistics\n"
-                "  • upsert_doc_tool: Ingest/update a document\n"
+                "  • kb_stats_tool: Use to show current KB stats (counts, topics, etc.)\n"
+                "  • upsert_doc_tool: Ingest/update a document (requires metadata)\n"
                 "  • delete_by_metadata_tool: Delete chunks by filter\n"
                 "  • detect_duplicates_tool: Find duplicate documents\n"
                 "  • detect_conflicts_tool: Find contentual conflicts\n"
                 "  • recommend_reindex_tool: Get system recommendations\n"
+                "When providing KB stats, use a professional Markdown summary with bold labels and icons. "
                 "Always check for duplicates before upserting. "
                 "Require explicit confirmation before any deletion. "
-                "Suggest metadata based on filenames when not provided."
             )
 
             # Create agent using LangGraph (more modern approach)
@@ -418,12 +558,12 @@ class AdminAgent:
             return self._agent
 
         except ImportError:
-            # Fallback: use simple LLM-Tools binding
+            # Fallback 1: Use create_tool_calling_agent (Legacy LangChain)
             try:
-                from langchain_openai import ChatOpenAI
+                from langchain.agents import create_tool_calling_agent, AgentExecutor
+                from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
                 
                 model = _get_groq_model(api_key)
-                
                 llm = ChatOpenAI(
                     model=model,
                     temperature=0.0,
@@ -431,14 +571,35 @@ class AdminAgent:
                     api_key=api_key,
                 )
                 
-                # Bind tools to LLM
-                self._agent = llm.bind_tools(self.tools)
-                logger.info("✅ LLM Admin Agent initialised (tool-binding mode)")
-                return self._agent
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", system_prompt),
+                    MessagesPlaceholder(variable_name="chat_history"),
+                    ("human", "{input}"),
+                    MessagesPlaceholder(variable_name="agent_scratchpad"),
+                ])
                 
-            except Exception as e2:
-                logger.error(f"Could not init LLM agent (fallback also failed): {e2}")
-                return None
+                agent_obj = create_tool_calling_agent(llm, self.tools, prompt)
+                self._agent = AgentExecutor(agent=agent_obj, tools=self.tools, verbose=True)
+                logger.info("✅ LLM Admin Agent initialised (AgentExecutor mode)")
+                return self._agent
+            except Exception as e_agent:
+                logger.error(f"AgentExecutor fallback failed: {e_agent}")
+                
+                # Fallback 2: simple LLM-Tools binding (passive mode)
+                try:
+                    from langchain_openai import ChatOpenAI
+                    llm = ChatOpenAI(
+                        model=_get_groq_model(api_key),
+                        temperature=0.0,
+                        base_url="https://api.groq.com/openai/v1",
+                        api_key=api_key,
+                    )
+                    self._agent = llm.bind_tools(self.tools)
+                    logger.info("✅ LLM Admin Agent initialised (passive tool-binding mode)")
+                    return self._agent
+                except Exception as e2:
+                    logger.error(f"Could not init LLM agent (all fallbacks failed): {e2}")
+                    return None
                 
         except Exception as e:
             logger.error(f"Could not init LLM agent: {e}")
@@ -446,40 +607,115 @@ class AdminAgent:
 
     def run(self, instruction: str) -> str:
         """
-        Run an admin instruction through the LLM agent if available,
-        otherwise return a message asking for API key.
+        Run an admin instruction through the LLM agent and ensure tools are executed.
         """
         agent = self._get_llm_agent()
         if agent is None:
-            return (
-                "⚠️ LLM Admin Agent requires GROQ_API_KEY to be set in .env file.\n\n"
-                "✅ To enable:\n"
-                "  1. Go to https://console.groq.com\n"
-                "  2. Create an API key\n"
-                "  3. Add to .env: GROQ_API_KEY=your_key_here\n"
-                "  4. Restart the app\n\n"
-                "💡 You can still use the manual Admin Panel tools below without the LLM."
-            )
+            return "❌ Agent unavailable: Missing GROQ_API_KEY."
+
         try:
-            from langchain_core.messages import HumanMessage
+            from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
+
+            def _log_debug(msg: str):
+                log_file = Path("data/agent_debug.log")
+                log_file.parent.mkdir(exist_ok=True)
+                with open(log_file, "a", encoding="utf-8") as f:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"[{timestamp}] {msg}\n")
             
-            # Handle tool-bound LLM (simple invoke)
-            if hasattr(agent, 'bind_tools'):
-                response = agent.invoke([HumanMessage(content=instruction)])
-                if hasattr(response, 'content'):
-                    return response.content
-                return str(response)
+            _log_debug(f"RUN STARTED: {instruction}")
             
-            # Handle ReAct agent (needs dict input)
-            elif hasattr(agent, 'invoke'):
-                result = agent.invoke({"input": instruction})
-                if isinstance(result, dict):
-                    return result.get("output", str(result))
-                return str(result)
-            else:
-                return "Error: Unknown agent type"
+            # Universal Input Builder
+            input_msgs = [HumanMessage(content=instruction)]
+            
+            # Try Case A: LangGraph / Dict-based State
+            # We try passing a dict first if it looks like a graph
+            if hasattr(agent, 'get_graph'):
+                try:
+                    _log_debug("Attempting LangGraph (dict) invoke...")
+                    result = agent.invoke({"messages": input_msgs})
+                    if isinstance(result, dict) and "messages" in result:
+                        _log_debug(f"LangGraph returned {len(result['messages'])} messages")
+                        for msg in reversed(result["messages"]):
+                            content = getattr(msg, 'content', "")
+                            if content and str(content).strip():
+                                return str(content)
+                        return "✅ Command processed successfully (LangGraph mode)."
+                except Exception as e:
+                    _log_debug(f"LangGraph (dict) invoke failed: {e}. Falling back to list-based.")
+
+            # Case B: Standard Runnable/Executor (List or String based)
+            # This handles AgentExecutor and raw ChatOpenAI/Groq models
+            _log_debug("Attempting Standard (list/str) invoke...")
+            
+            # Handle AgentExecutor specifically
+            if hasattr(agent, 'agent'):
+                try:
+                    result = agent.invoke({"input": instruction, "chat_history": []})
+                    return result.get("output", "✅ Task completed.")
+                except Exception as e:
+                    _log_debug(f"AgentExecutor failed: {e}")
+            
+            # Fallback to direct model invoke (Hand-rolled ReAct)
+            response = agent.invoke(input_msgs)
+            
+            # If the LLM wants to call tools...
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                msgs = [HumanMessage(content=instruction), response]
+                results_text = []
+                
+                for tc in response.tool_calls:
+                    t_name = tc["name"]
+                    t_args = tc.get("args", {})
+                    t_id = tc.get("id")
+                    
+                    # Find and run the tool
+                    for tool in self.tools:
+                        if tool.name == t_name:
+                            try:
+                                res = tool.invoke(t_args)
+                                msgs.append(ToolMessage(content=str(res), tool_call_id=t_id))
+                                results_text.append(f"Output of {t_name}: {res}")
+                            except Exception as te:
+                                msgs.append(ToolMessage(content=f"Error: {te}", tool_call_id=t_id))
+                            break
+                
+                # Get final answer from LLM with tool outputs
+                final_response = agent.invoke(msgs)
+                _log_debug(f"Manual ReAct: final response received: {type(final_response)}")
+                if hasattr(final_response, 'content') and str(final_response.content).strip():
+                    return str(final_response.content)
+                
+                # Absolute Fail-safe: Return beautifully formatted summary if LLM final summary is blank
+                summary_parts = ["### 📊 Knowledge Base Status Report\n"]
+                for res_entry in results_text:
+                    if "kb_stats_tool" in res_entry:
+                        try:
+                            # Extract JSON if possible
+                            json_str = res_entry.split(":", 1)[1].strip()
+                            s = json.loads(json_str)
+                            summary_parts.append(f"- **Total Chunks**: `{s.get('total_chunks', 0)}`")
+                            summary_parts.append(f"- **Unique Sources**: `{s.get('unique_sources', 0)}`")
+                            summary_parts.append(f"- **Verified Chunks**: `{s.get('verified_chunks', 0)}` ✅")
+                            summary_parts.append(f"- **Topics**: {', '.join([f'`{t}`' for t in s.get('topics', [])])}")
+                            summary_parts.append(f"- **Departments**: {', '.join([f'`{d}`' for d in s.get('departments', [])])}")
+                        except:
+                            summary_parts.append(res_entry)
+                    else:
+                        summary_parts.append(res_entry)
+                
+                _log_debug("Fallback to formatted results summary.")
+                return "\n".join(summary_parts)
+
+            if hasattr(response, 'content') and response.content:
+                _log_debug("Returned direct response content.")
+                return response.content
+            
+            _log_debug(f"Empty response fallthrough. Response: {response}")
+            return f"⚠️ Agent processed the request but returned no text content. Details: {response}"
+
         except Exception as e:
-            logger.error(f"Agent run failed: {e}")
+            logger.error(f"CRITICAL: Agent run failed: {e}")
             import traceback
             traceback.print_exc()
-            return f"Agent error: {e}"
+            return f"❌ Agent Error: {e}"

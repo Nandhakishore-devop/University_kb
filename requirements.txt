@@ -36,3 +36,9 @@ openai>=1.30.0
 # Utilities
 tiktoken>=0.7.0
 loguru>=0.7.0
+
+# Conversational AI (Agents)
+langgraph>=0.1.0
+
+# Document Generation
+fpdf2>=2.7.0

@@ -34,8 +34,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.admin_agent import AdminAgent
 from src.chroma_store import ChromaStore
 from src.retriever import UniversityRetriever
+from src.services.report_service import ReportService
+from src.services.profile_service import ProfileService
 from src.schemas import DocMetadata, SearchFilter
 from src.utils import suggest_metadata_from_filename
+from src.student_agent import StudentAgent
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -209,6 +212,14 @@ st.markdown(
         border: 1px solid var(--border) !important;
         border-radius: var(--radius-md) !important;
         margin-bottom: 0.75rem !important;
+        padding: 1rem !important;
+    }
+    .stChatMessage [data-testid="stChatMessageContent"] {
+        margin-top: 0 !important;
+    }
+    .stChatMessage [data-testid="stChatMessageAvatar"] {
+        width: 38px !important;
+        height: 38px !important;
     }
 
     /* ── Hero Header ──────────────────────────────────────────────────── */
@@ -599,9 +610,22 @@ def get_retriever() -> UniversityRetriever:
     return UniversityRetriever(store=get_store())
 
 
+def get_agent():
+    from src.admin_agent import AdminAgent
+    return AdminAgent(get_store())
+
+
 @st.cache_resource
-def get_agent() -> AdminAgent:
-    return AdminAgent(store=get_store())
+def get_report_service() -> ReportService:
+    return ReportService(store=get_store())
+
+
+@st.cache_resource
+def get_profile_service() -> ProfileService:
+    return ProfileService()
+@st.cache_resource
+def get_student_agent() -> StudentAgent:
+    return StudentAgent(store=get_store())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -610,6 +634,20 @@ def get_agent() -> AdminAgent:
 
 store = get_store()
 stats = store.get_stats()
+
+# ── Initialize Session State ─────────────────────────────────────────────
+if "user_profile" not in st.session_state:
+    from src.schemas import UserProfile
+    st.session_state.user_profile = UserProfile(user_id="anonymous")
+
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+
+if "is_student_authed" not in st.session_state:
+    st.session_state.is_student_authed = False
+
+if "student_id" not in st.session_state:
+    st.session_state.student_id = None
 
 with st.sidebar:
     st.markdown(
@@ -642,6 +680,31 @@ with st.sidebar:
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
 
+    # ── Student Login ────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
+        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Student Authentication</div>',
+        unsafe_allow_html=True,
+    )
+    
+    s_roll = st.text_input("Enter Roll Number", key="s_roll_input", value=st.session_state.student_id or "")
+    if s_roll:
+        if st.session_state.student_id != s_roll:
+            # New Login: Fetch persistent profile
+            profile_svc = get_profile_service()
+            st.session_state.user_profile = profile_svc.get_profile(s_roll)
+            st.session_state.student_id = s_roll
+            st.session_state.is_student_authed = True
+            st.rerun()
+
+        st.session_state.is_student_authed = True
+        st.success(f"✓ Logged in as {s_roll}")
+    else:
+        st.session_state.is_student_authed = False
+        st.info("Log in to enable stateful AI help.")
+
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+
     st.markdown(
         '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
         'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Topics</div>',
@@ -659,6 +722,60 @@ with st.sidebar:
             "No topics yet.</span>",
             unsafe_allow_html=True,
         )
+
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+
+    # ── Student Personalization Profile ──────────────────────────────────
+    st.markdown(
+        '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
+        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Your Student Profile</div>',
+        unsafe_allow_html=True,
+    )
+    
+    # Interests
+    p_interests = st.multiselect(
+        "Select Interests (to boost results)",
+        options=stats.unique_topics,
+        default=st.session_state.user_profile.interests,
+        key="profile_interests"
+    )
+    
+    # Sync interests to profile and save
+    if p_interests != st.session_state.user_profile.interests:
+        st.session_state.user_profile.interests = p_interests
+        get_profile_service().save_profile(st.session_state.user_profile)
+
+    # Privacy Toggle
+    p_privacy = st.toggle(
+        "Privacy Opt-out",
+        value=st.session_state.user_profile.privacy_opt_out,
+        help="Disable personalized ranking and activity tracking.",
+        key="profile_privacy"
+    )
+    
+    # Sync privacy to profile and save
+    if p_privacy != st.session_state.user_profile.privacy_opt_out:
+        st.session_state.user_profile.privacy_opt_out = p_privacy
+        get_profile_service().save_profile(st.session_state.user_profile)
+
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+    
+    st.markdown(
+        '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
+        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Admin Authentication</div>',
+        unsafe_allow_html=True,
+    )
+    
+    admin_secret = os.getenv("ADMIN_SECRET", "admin123")
+    user_secret = st.text_input("Enter Secret to unlock Admin features", type="password", key="admin_gate")
+    
+    if user_secret == admin_secret:
+        st.session_state.is_admin = True
+        st.success("✓ Admin Unlocked")
+    else:
+        st.session_state.is_admin = False
+        if user_secret:
+            st.error("✕ Invalid Secret")
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
 
@@ -711,9 +828,16 @@ st.markdown(
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════
 
-tab_student, tab_admin, tab_agent = st.tabs(
-    ["  🎓  Student Search  ", "  🛠️  Admin Panel  ", "  🤖  AI Agent  "]
-)
+tab_labels = ["  🎓  Student Search  "]
+is_authed = st.session_state.get("is_admin", False)
+
+if is_authed:
+    tab_labels += ["  🛠️  Admin Panel  ", "  🤖  AI Agent  "]
+
+tabs = st.tabs(tab_labels)
+tab_student = tabs[0]
+tab_admin = tabs[1] if is_authed else None
+tab_agent = tabs[2] if is_authed else None
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 1 — STUDENT SEARCH
@@ -721,137 +845,103 @@ tab_student, tab_admin, tab_agent = st.tabs(
 
 with tab_student:
     st.markdown(
-        '<div class="section-heading">Search University Documents</div>'
+        '<div class="section-heading">Campus Information Chatbot</div>'
         '<div class="section-caption">'
-        "Full-text and semantic search across public handbooks, circulars, and policies."
+        "Ask anything about college rules, campus facilities, or academic policies. "
+        "Use natural language to get instant answers from our verified internal sources."
         "</div>",
         unsafe_allow_html=True,
     )
 
     retriever = get_retriever()
+    
+    # ── Advanced Filters (Optional) ─────────────────────────────────────
+    with st.expander("🛠️ Advanced Search Filters", expanded=False):
+        all_topics = [""] + stats.unique_topics
+        all_depts  = [""] + stats.unique_departments
+        all_years  = [""] + ([str(y) for y in range(stats.year_range[1], stats.year_range[0] - 1, -1)] if stats.year_range[0] else [])
+        
+        f1, f2, f3 = st.columns(3)
+        with f1: f_topic = st.selectbox("Topic", all_topics, key="s_topic")
+        with f2: f_dept = st.selectbox("Department", all_depts, key="s_dept")
+        with f3: f_year = st.selectbox("Year", all_years, key="s_year")
 
-    # ── Search bar ──────────────────────────────────────────────────────
-    q_col, k_col = st.columns([6, 1])
-    with q_col:
-        query = st.text_input(
-            "query",
-            placeholder="e.g. What are the rules for examinations?",
-            label_visibility="collapsed",
-        )
-    with k_col:
-        top_k = st.number_input("Top K", min_value=1, max_value=20, value=5)
+    # ── Chat Logic ──────────────────────────────────────────────────────
+    if "student_messages" not in st.session_state:
+        st.session_state.student_messages = []
+    
+    # Render Chat History
+    for msg in st.session_state.student_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if "results" in msg and msg["results"]:
+                with st.expander("📚 Verified Sources"):
+                    for i, chunk in enumerate(msg["results"], 1):
+                        st.markdown(f"**Source {i}:** {chunk.metadata.get('source_file')}")
+                        st.caption(chunk.content[:400] + "...")
 
-    # ── Filters ─────────────────────────────────────────────────────────
-    st.markdown('<div class="filter-label">Filters</div>', unsafe_allow_html=True)
-    f1, f2, f3, f4 = st.columns(4)
-
-    all_topics = [""] + stats.unique_topics
-    all_depts  = [""] + stats.unique_departments
-    all_years  = [""] + (
-        [str(y) for y in range(stats.year_range[1], stats.year_range[0] - 1, -1)]
-        if stats.year_range[0]
-        else []
-    )
-
-    with f1:
-        f_topic   = st.selectbox("Topic", all_topics, key="s_topic")
-    with f2:
-        f_dept    = st.selectbox("Department", all_depts, key="s_dept")
-    with f3:
-        f_year    = st.selectbox("Year", all_years, key="s_year")
-    with f4:
-        f_doctype = st.selectbox(
-            "Doc Type", ["", "handbook", "circular", "policy", "other"], key="s_dtype"
-        )
-
-    search_clicked = st.button(
-        "🔍  Search", type="primary", use_container_width=True, key="search_btn"
-    )
-
-    # ── Execute search ───────────────────────────────────────────────────
-    if search_clicked and query.strip():
-        filters = SearchFilter(
-            topic=f_topic or None,
-            department=f_dept or None,
-            year=int(f_year) if f_year else None,
-            doc_type=f_doctype or None,
-            access="public",
-        )
-
-        with st.spinner("Searching knowledge base…"):
-            results = retriever.search(
-                query=query,
-                filters=filters,
-                top_k=top_k,
-                admin_override=False,
-            )
-
-        if not results:
-            st.markdown(
-                '<div class="empty-state">'
-                '<div class="empty-state-icon">🔎</div>'
-                '<div class="empty-state-title">No results found</div>'
-                '<div class="empty-state-body">Try broader keywords or adjust your filters.<br>'
-                "The knowledge base may not contain documents matching this query.</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f'<div class="results-summary">✦ Found '
-                f'<strong>{len(results)}</strong> relevant chunk'
-                f"{'s' if len(results) != 1 else ''} for your query</div>",
-                unsafe_allow_html=True,
-            )
-
-            for i, chunk in enumerate(results, 1):
-                access     = chunk.metadata.get("access", "public")
-                card_cls   = "result-card" + (" internal" if access == "internal" else "")
-                meta_items = "".join([
-                    _meta_item("📁", "Topic",   str(chunk.metadata.get("topic",   ""))),
-                    _meta_item("🏛",  "Dept",    str(chunk.metadata.get("department", ""))),
-                    _meta_item("📅", "Year",    str(chunk.metadata.get("year",    ""))),
-                    _meta_item("📄", "Type",    str(chunk.metadata.get("doc_type",""))),
-                    _meta_item("🔖", "Version", str(chunk.metadata.get("version", ""))),
-                    _meta_item("📃", "Page",    str(chunk.metadata.get("page_number",""))),
-                ])
-
-                st.markdown(
-                    f"""
-                    <div class="{card_cls}">
-                        <div class="result-card-header">
-                            <div class="result-card-title">
-                                {_rank_badge(i)}&ensp;{chunk.metadata.get("source_file", "—")}
-                            </div>
-                            <div class="result-card-badges">
-                                {_access_badge(access)}
-                                {_score_badge(chunk.score)}
-                            </div>
-                        </div>
-                        <p class="result-card-body">{chunk.content[:900]}</p>
-                        <div class="result-card-meta">{meta_items}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+    # Chat Input
+    if user_query := st.chat_input("Ask about rules, policies, or campus life..."):
+        st.session_state.student_messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+        
+        with st.chat_message("assistant"):
+            with st.spinner("Campus Assistant is thinking..."):
+                s_agent = get_student_agent()
+                graph_output = s_agent.ask(
+                    query=user_query,
+                    profile=st.session_state.user_profile,
+                    history=st.session_state.get("student_history", [])
                 )
+                
+                ai_answer = graph_output.get("answer", "I couldn't find a specific answer in the documents.")
+                results = graph_output.get("results", [])
+                
+                # Persist history
+                if st.session_state.is_student_authed:
+                    st.session_state.student_history = graph_output.get("history", [])
+                
+                # Display Answer
+                st.markdown(ai_answer)
+                
+                # Show references if any
+                if results:
+                    with st.expander("📚 Verified Sources"):
+                        for i, chunk in enumerate(results, 1):
+                            st.markdown(f"**Source {i}:** {chunk.metadata.get('source_file')}")
+                            st.caption(chunk.content[:400] + "...")
+                
+                st.session_state.student_messages.append({
+                    "role": "assistant", 
+                    "content": ai_answer,
+                    "results": results
+                })
+        
+        st.rerun()
 
-    elif search_clicked:
-        st.warning("Please enter a search query before pressing Search.")
+    # Clear Chat Button
+    if st.session_state.student_messages:
+        if st.sidebar.button("🗑️ Clear Student Chat"):
+            st.session_state.student_messages = []
+            st.session_state.student_history = []
+            st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 2 — ADMIN PANEL
 # ═══════════════════════════════════════════════════════════════════════════
 
-with tab_admin:
-    agent = get_agent()
+if tab_admin:
+    with tab_admin:
+        agent = get_agent()
 
-    st.markdown(
-        '<div class="section-heading">Admin Panel</div>'
-        '<div class="section-caption">'
-        "Ingest, manage, inspect, and export knowledge-base documents."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+        st.markdown(
+            '<div class="section-heading">Admin Panel</div>'
+            '<div class="section-caption">'
+            "Ingest, manage, inspect, and export knowledge-base documents."
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     # ── A: KB Statistics ─────────────────────────────────────────────────
     with st.expander("📊  Knowledge Base Statistics", expanded=True):
@@ -884,6 +974,63 @@ with tab_admin:
         if st.button("🔄  Refresh Stats", key="refresh_stats"):
             st.cache_resource.clear()
             st.rerun()
+
+    # ── A.1: Participation Analytics ─────────────────────────────────────
+    with st.expander("📈  Participation & Engagement Analytics", expanded=False):
+        report_svc = get_report_service()
+        report = report_svc.get_participation_report()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                f'<div class="stat-card" style="border-left:3px solid var(--accent-blue);">'
+                f'<div class="stat-number">{report.query_resolution_rate * 100:.0f}%</div>'
+                f'<div class="stat-label">Resolution Rate</div>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f'<div class="stat-card" style="border-left:3px solid var(--accent-teal);">'
+                f'<div class="stat-number">{report.monthly_active_users}</div>'
+                f'<div class="stat-label">App MAU</div>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            st.markdown(
+                f'<div class="stat-card" style="border-left:3px solid var(--accent-gold);">'
+                f'<div class="stat-number">{report.volunteer_retention_rate * 100:.0f}%</div>'
+                f'<div class="stat-label">Volunteer Retention</div>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)
+        col_lg, col_sm = st.columns([2, 1])
+
+        with col_lg:
+            st.markdown('<div class="filter-label">Contributors per Department</div>', unsafe_allow_html=True)
+            dept_df = pd.DataFrame([
+                {"Department": d, "Contributors": c} 
+                for d, c in report.contributors_per_dept.items()
+            ])
+            if not dept_df.empty:
+                st.bar_chart(dept_df.set_index("Department"))
+            else:
+                st.caption("No contributor data available.")
+
+        with col_sm:
+            st.markdown('<div class="filter-label">Parity Health</div>', unsafe_allow_html=True)
+            if report.departmental_parity_gap:
+                st.error("Gaps Detected ( < 3 Contributors):")
+                for d in report.departmental_parity_gap:
+                    st.markdown(f"- `{d}`")
+            else:
+                st.success("✅ All departments reach parity target.")
+            
+            st.markdown("---")
+            st.metric("Avg Verified Chunks / Vol", f"{report.avg_verified_per_volunteer:.1f}")
 
     # ── B: Ingest Document ───────────────────────────────────────────────
     with st.expander("📤  Ingest / Upsert Document", expanded=False):
@@ -937,29 +1084,32 @@ with tab_admin:
             )
         m_section = st.text_input("Section (optional)", key="ingest_section")
 
-        btn_check, btn_ingest = st.columns(2)
-
-        with btn_check:
-            if st.button(
-                "🔎  Check for Duplicates",
-                disabled=not uploaded_file,
-                key="check_dup",
-            ):
-                result = agent.detect_duplicates(
-                    {"topic": m_topic, "department": m_dept, "year": m_year}
+        # ── Real-time Duplication Advisor ────────────────────────────────
+        if uploaded_file and m_topic and m_dept:
+            dup_result = agent.detect_duplicates(
+                {"topic": m_topic, "department": m_dept, "year": m_year}
+            )
+            if "NO_DUPLICATES" not in dup_result:
+                st.markdown(
+                    f'<div class="danger-banner" style="margin-top:10px; border-left:4px solid var(--accent-red);">'
+                    f'<strong>⚠️ Duplicate Alert:</strong><br>{dup_result}</div>',
+                    unsafe_allow_html=True
                 )
-                if "NO_DUPLICATES" in result:
-                    st.success(result)
-                else:
-                    st.warning(result)
+            else:
+                st.markdown(
+                    '<div style="font-size:0.8rem; color:var(--accent-teal); margin-top:10px;">'
+                    '✓ No duplicate topic/department detected.</div>',
+                    unsafe_allow_html=True
+                )
 
-        with btn_ingest:
-            if st.button(
-                "⬆️  Ingest Document",
-                type="primary",
-                disabled=not uploaded_file,
-                key="ingest_btn",
-            ):
+        st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)
+        if st.button(
+            "⬆️  Ingest Document",
+            type="primary",
+            disabled=not uploaded_file,
+            key="ingest_btn",
+            use_container_width=True
+        ):
                 if uploaded_file:
                     with tempfile.NamedTemporaryFile(
                         delete=False, suffix=Path(uploaded_file.name).suffix
@@ -1096,68 +1246,98 @@ with tab_admin:
             else:
                 st.success(rec)
 
+    # ── F: Automated Deduplication Sweep ─────────────────────────────────
+    with st.expander("🧹  Automated Deduplication Sweep", expanded=False):
+        st.markdown(
+            '<div class="section-caption">'
+            "Scan the KB for superseded document versions and semantically redundant content. "
+            "Identified duplicates will be moved to <code>archive_kb</code>."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("🚀  Run Duplicate Sweep", type="primary", key="sweep_btn"):
+            with st.spinner("Sweeping for duplicates…"):
+                from src.admin_agent import _auto_deduplicate
+                report = _auto_deduplicate(agent._store)
+            
+            if "SUCCESS" in report or "✅" in report:
+                st.success(report)
+                st.cache_resource.clear()
+            else:
+                st.info(report)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 3 — ADMIN AI AGENT
 # ═══════════════════════════════════════════════════════════════════════════
 
-with tab_agent:
-    st.markdown(
-        '<div class="section-heading">Admin AI Agent</div>'
-        '<div class="section-caption">'
-        "Manage your knowledge base through natural-language conversation. "
-        "Requires <code>GROQ_API_KEY</code> in your environment."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    if not os.getenv("GROQ_API_KEY"):
+if tab_agent:
+    with tab_agent:
         st.markdown(
-            '<div class="empty-state">'
-            '<div class="empty-state-icon">🤖</div>'
-            '<div class="empty-state-title">AI Agent Unavailable</div>'
-            '<div class="empty-state-body">'
-            "<code>GROQ_API_KEY</code> is not set in your environment.<br>"
-            "Set the variable and restart the app to enable this feature.<br><br>"
-            "All admin tasks remain available in the <strong>Admin Panel</strong> tab."
-            "</div></div>",
+            '<div class="section-heading">Admin AI Agent</div>'
+            '<div class="section-caption">'
+            "Manage your knowledge base through natural-language conversation."
+            "</div>",
             unsafe_allow_html=True,
         )
-    else:
-        agent_inst = get_agent()
 
-        # Chat history in session state
-        if "agent_messages" not in st.session_state:
-            st.session_state.agent_messages = []
-
-        # Display chat history
-        for msg in st.session_state.agent_messages:
-            role = msg["role"]
-            with st.chat_message(role):
-                st.markdown(msg["content"])
-
-        # Input
-        user_input = st.chat_input("Ask the Admin Agent… (e.g. 'Show KB stats')")
-        if user_input:
-            st.session_state.agent_messages.append(
-                {"role": "user", "content": user_input}
+        if not os.getenv("GROQ_API_KEY"):
+            st.markdown(
+                '<div class="empty-state">'
+                '<div class="empty-state-icon">🤖</div>'
+                '<div class="empty-state-title">AI Agent Unavailable</div>'
+                '<div class="empty-state-body">'
+                "<code>GROQ_API_KEY</code> is not set in your environment.<br>"
+                "Set the variable and restart the app to enable this feature.<br><br>"
+                "All admin tasks remain available in the <strong>Admin Panel</strong> tab."
+                "</div></div>",
+                unsafe_allow_html=True,
             )
-            with st.chat_message("user"):
-                st.markdown(user_input)
+        else:
+            agent_inst = get_agent()
 
-            with st.chat_message("assistant"):
-                with st.spinner("Agent thinking…"):
-                    response = agent_inst.run(user_input)
-                st.markdown(response)
-
-            st.session_state.agent_messages.append(
-                {"role": "assistant", "content": response}
-            )
-
-        col_clear, col_space = st.columns([1, 3])
-        with col_clear:
-            if st.button("🗑️ Clear Chat", use_container_width=True):
+            # Chat history in session state
+            if "agent_messages" not in st.session_state:
                 st.session_state.agent_messages = []
+
+            # Display chat history (Standard Flow)
+            for msg in st.session_state.agent_messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            # Input (remains at bottom naturally)
+            if user_input := st.chat_input("Ask the Admin Agent… (e.g. 'Show KB stats')"):
+                st.session_state.agent_messages.append({"role": "user", "content": user_input})
+                with st.chat_message("user"):
+                    st.markdown(user_input)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("Executing admin command…"):
+                        response = agent_inst.run(user_input)
+                    st.markdown(response)
+                    st.session_state.agent_messages.append({"role": "assistant", "content": response})
+                
                 st.rerun()
+
+            col_clear, col_space = st.columns([1, 3])
+            with col_clear:
+                if st.button("🗑️ Clear Chat", use_container_width=True):
+                    st.session_state.agent_messages = []
+                    st.rerun()
+
+            # ─────────────────────────────────────────────────────────────────
+            # DEBUG LOGS (Traceability)
+            # ─────────────────────────────────────────────────────────────────
+            with st.expander("🛠️ Debug Information (Agent Logs)", expanded=False):
+                log_file = "data/agent_debug.log"
+                if os.path.exists(log_file):
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    st.text_area("Live Agent Logs (Last 50 events)", value="".join(lines[-50:]), height=300)
+                    if st.button("🗑️ Clear Debug Logs"):
+                        os.remove(log_file)
+                        st.rerun()
+                else:
+                    st.info("No debug logs found yet. Run the agent first!")
 
         st.markdown("")
         st.markdown(

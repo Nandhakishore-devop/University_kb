@@ -13,7 +13,7 @@ from langchain_core.documents import Document
 from loguru import logger
 
 from src.chroma_store import ChromaStore
-from src.schemas import ChunkRecord, SearchFilter
+from src.schemas import ChunkRecord, SearchFilter, UserProfile
 
 
 class UniversityRetriever:
@@ -38,6 +38,7 @@ class UniversityRetriever:
         filters: Optional[SearchFilter] = None,
         top_k: int = 5,
         admin_override: bool = False,
+        user_profile: Optional[UserProfile] = None,
     ) -> List[ChunkRecord]:
         """
         Run similarity search with optional metadata filters.
@@ -59,14 +60,120 @@ class UniversityRetriever:
         results = self._store.similarity_search(
             query=query,
             search_filter=filters,
-            top_k=top_k,
+            top_k=top_k * 2 if user_profile else top_k,  # Over-fetch for re-ranking
         )
 
-        logger.info(
-            f"Retrieved {len(results)} chunks for query='{query[:50]}…' "
-            f"(admin={admin_override})"
-        )
+        # Personalization: Re-rank based on user interests
+        if user_profile and user_profile.interests:
+            for r in results:
+                topic = r.metadata.get("topic", "")
+                if topic in user_profile.interests:
+                    r.score += 0.2  # Boost weight
+                    r.explanation = f"Boosted because you are interested in {topic}."
+            results = sorted(results, key=lambda x: x.score, reverse=True)[:top_k]
+
+        # Privacy: Skip logging if opted out
+        if user_profile and user_profile.privacy_opt_out:
+            logger.debug(f"Privacy: Skipping activity log for user {user_profile.user_id}")
+        else:
+             logger.info(
+                f"Retrieved {len(results)} chunks for query='{query[:50]}…' "
+                f"(admin={admin_override}, personal={bool(user_profile)})"
+            )
         return results
+
+    def search_events(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> List[ChunkRecord]:
+        """Semantic search specifically for university events and posters."""
+        filters = SearchFilter(doc_type="poster", access="public")
+        return self.search(query, filters=filters, top_k=top_k)
+
+    def get_recommendations(
+        self,
+        reference_chunk_id: Optional[str] = None,
+        user_profile: Optional[UserProfile] = None,
+        top_k: int = 5,
+    ) -> List[ChunkRecord]:
+        """
+        Recommend documents based on a reference chunk or user profile.
+        - If reference_chunk_id is provided, finds similar content (item-to-item).
+        - If user_profile is provided, finds content aligned with user interests (user-to-item).
+        """
+        if reference_chunk_id:
+            # Find the reference chunk's content
+            res = self._store._collection.get(ids=[reference_chunk_id], include=["documents", "metadatas"])
+            if not res or not res["documents"]:
+                return []
+            
+            content = res["documents"][0]
+            # Search for similar content, excluding the reference chunk itself
+            results = self.search(query=content, top_k=top_k + 1)
+            recs = [r for r in results if r.chunk_id != reference_chunk_id][:top_k]
+            for r in recs:
+                r.explanation = f"Similar to content you are currently viewing: '{r.metadata.get('topic')}'"
+                r.evidence = ["semantic_similarity", r.metadata.get("topic", "general")]
+            return recs
+
+        if user_profile and user_profile.interests:
+            # Multi-topic semantic search based on interests
+            combined_query = " ".join(user_profile.interests)
+            results = self.search(query=combined_query, top_k=top_k)
+            for r in results:
+                r.explanation = f"Recommended based on your interest in: {', '.join(user_profile.interests[:3])}"
+                r.evidence = user_profile.interests
+            return results
+
+        return []
+
+    def get_event_summary(self, topic: str) -> dict:
+        """
+        Produce a trustworthy summary for an event topic, sourced only
+        from 'verified' documents (posters, circulars).
+        """
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return {"summary": "API Key missing.", "verified": False}
+
+        # Filter for verified event docs
+        filters = SearchFilter(topic=topic, access="public")
+        # Note: SearchFilter needs verification_status handling? 
+        # I'll manually filter for now as SearchFilter lacks it.
+        
+        results = self.search(query=topic, filters=filters, top_k=10)
+        verified_records = [r for r in results if r.metadata.get("verification_status") == "verified"]
+        
+        if not verified_records:
+            return {
+                "summary": "No verified records found for this event. Summary unavailable for safety.",
+                "verified": False,
+                "sources": []
+            }
+
+        # Summarize via LLM
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import ChatPromptTemplate
+        
+        context = "\n\n".join([r.content for r in verified_records])
+        llm = ChatOpenAI(model="mixtral-8x7b-32768", temperature=0, api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Summarize the following event based ONLY on the verified records provided. Provide keys: Date, Venue, Goal, and Eligibility."),
+            ("human", "Verified Documents:\n{context}")
+        ])
+        
+        try:
+            chain = prompt | llm
+            response = chain.invoke({"context": context})
+            return {
+                "summary": response.content,
+                "verified": True,
+                "sources": [r.metadata.get("source_file") for r in verified_records]
+            }
+        except Exception as e:
+            return {"summary": f"Summary generation failed: {e}", "verified": False}
 
     # ------------------------------------------------------------------
     # LangChain Document format (for compatibility with chains/agents)
