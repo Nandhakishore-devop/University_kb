@@ -60,26 +60,13 @@ class UniversityRetriever:
         results = self._store.similarity_search(
             query=query,
             search_filter=filters,
-            top_k=top_k * 2 if user_profile else top_k,  # Over-fetch for re-ranking
+            top_k=top_k,
         )
 
-        # Personalization: Re-rank based on user interests
-        if user_profile and user_profile.interests:
-            for r in results:
-                topic = r.metadata.get("topic", "")
-                if topic in user_profile.interests:
-                    r.score += 0.2  # Boost weight
-                    r.explanation = f"Boosted because you are interested in {topic}."
-            results = sorted(results, key=lambda x: x.score, reverse=True)[:top_k]
-
-        # Privacy: Skip logging if opted out
-        if user_profile and user_profile.privacy_opt_out:
-            logger.debug(f"Privacy: Skipping activity log for user {user_profile.user_id}")
-        else:
-             logger.info(
-                f"Retrieved {len(results)} chunks for query='{query[:50]}…' "
-                f"(admin={admin_override}, personal={bool(user_profile)})"
-            )
+        logger.info(
+            f"Retrieved {len(results)} chunks for query='{query[:50]}…' "
+            f"(admin={admin_override})"
+        )
         return results
 
     def search_events(

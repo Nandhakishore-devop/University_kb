@@ -185,7 +185,16 @@ class ChromaStore:
         search_filter: Optional[SearchFilter] = None,
         top_k: int = 5,
     ) -> List[ChunkRecord]:
-        """Return top-k chunks most similar to query, with metadata & score."""
+        """Return top-k chunks most similar to query, with metadata & score.
+        
+        Defaults to status='active' if no status is specified in filters.
+        """
+        if search_filter is None:
+            search_filter = SearchFilter(status="active")
+        elif search_filter.status is None and search_filter.is_archived is None:
+            # If specifically looking for something, but no status filter, default to active
+            search_filter.status = "active"
+
         where = search_filter.to_where_clause() if search_filter else None
 
         kwargs: dict = {
@@ -217,6 +226,39 @@ class ChromaStore:
 
         return records
 
+    def get_version_history(self, topic: str, department: str) -> List[dict]:
+        """Return all versions of a specific document topic for a department, sorted by year/version."""
+        try:
+            result = self._collection.get(
+                where={
+                    "$and": [
+                        {"topic": {"$eq": topic}},
+                        {"department": {"$eq": department.upper()}},
+                    ]
+                },
+                include=["metadatas"]
+            )
+            metas = result.get("metadatas", [])
+            # Deduplicate by source_file + version + status
+            seen = set()
+            unique = []
+            # Sort by year (desc), then uploaded_time (desc)
+            sorted_metas = sorted(
+                metas, 
+                key=lambda x: (x.get("year", 0), x.get("uploaded_time", "")), 
+                reverse=True
+            )
+            
+            for m in sorted_metas:
+                key = (m.get("source_file"), m.get("version"), m.get("status"))
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(m)
+            return unique
+        except Exception as e:
+            logger.error(f"get_version_history failed: {e}")
+            return []
+
     def get_all_metadata(self, limit: int = 50_000) -> List[dict]:
         """Fetch all stored metadata dicts (no embeddings)."""
         result = self._collection.get(limit=limit, include=["metadatas"])
@@ -242,6 +284,7 @@ class ChromaStore:
         years = []
         verified_count = 0
         archived_count = 0
+        obsolete_count = 0
         contributors = set()
 
         for m in all_meta:
@@ -255,8 +298,11 @@ class ChromaStore:
             if m.get("verification_status") == "verified":
                 verified_count += 1
             
-            if m.get("is_archived") is True:
+            status = m.get("status", "active")
+            if status == "archived":
                 archived_count += 1
+            elif status == "obsolete":
+                obsolete_count += 1
             
             c_id = m.get("contributor_id")
             if c_id:
@@ -274,6 +320,7 @@ class ChromaStore:
             verified_chunks=verified_count,
             unique_contributors=len(contributors),
             archived_chunks=archived_count,
+            obsolete_chunks=obsolete_count,
         )
 
     def count(self) -> int:

@@ -25,15 +25,90 @@ from loguru import logger
 
 from src.chroma_store import ChromaStore
 from src.ingestion import chunk_document
-from src.schemas import DocMetadata, SearchFilter
+from src.schemas import DocMetadata, SearchFilter, FileIngestionStatus, IngestionJobReport
 from src.utils import suggest_metadata_from_filename
 
-from src.services.event_service import EventService
-from src.services.notification_service import NotificationService
-from src.services.report_service import ReportService
-from src.services.registration_service import RegistrationService
-from src.services.audit_service import AuditService
-from src.services.storage_service import SecureStorageService
+
+# ---------------------------------------------------------------------------
+
+
+def _bulk_ingest(
+    store: ChromaStore,
+    files_with_paths: list[dict], # List of {"path": str, "metadata": dict}
+    job_id: str
+) -> IngestionJobReport:
+    """Process a batch of files and return a detailed report."""
+    report = IngestionJobReport(
+        job_id=job_id,
+        start_time=datetime.now().isoformat(),
+        total_files=len(files_with_paths)
+    )
+
+    valid_extensions = [".pdf", ".docx", ".html", ".htm"]
+
+    for item in files_with_paths:
+        file_path = item["path"]
+        metadata_dict = item["metadata"]
+        filename = metadata_dict.get("source_file", Path(file_path).name)
+        
+        # 1. Extension check
+        ext = Path(file_path).suffix.lower()
+        if ext not in valid_extensions:
+            report.unsupported_files += 1
+            report.file_details.append(FileIngestionStatus(
+                filename=filename,
+                status="unsupported",
+                error=f"Format '{ext}' not supported."
+            ))
+            report.processed_files += 1
+            continue
+
+        # 2. Ingest
+        try:
+            # Re-use _upsert_doc logic indirectly
+            # Note: _upsert_doc returns a string, but we need more structured data.
+            # I'll create a slightly cleaner version for internal use or wrap it.
+            
+            # Setting defaults
+            if "status" not in metadata_dict:
+                metadata_dict["status"] = "active"
+            if "verification_status" not in metadata_dict:
+                metadata_dict["verification_status"] = "verified"
+            
+            metadata = DocMetadata(**metadata_dict)
+            chunks = chunk_document(file_path, metadata)
+            
+            if not chunks:
+                report.failed_files += 1
+                report.file_details.append(FileIngestionStatus(
+                    filename=filename,
+                    status="failed",
+                    error="No text extracted (may be empty or image-based PDF)"
+                ))
+            else:
+                n = store.upsert_chunks(chunks)
+                report.successful_files += 1
+                report.total_chunks += n
+                report.file_details.append(FileIngestionStatus(
+                    filename=filename,
+                    status="success",
+                    chunks=n
+                ))
+                logger.info(f"Bulk Audit: {filename} ingested ({n} chunks)")
+
+        except Exception as e:
+            report.failed_files += 1
+            report.file_details.append(FileIngestionStatus(
+                filename=filename,
+                status="failed",
+                error=str(e)
+            ))
+            logger.error(f"Bulk Error processing {filename}: {e}")
+        
+        report.processed_files += 1
+
+    report.end_time = datetime.now().isoformat()
+    return report
 
 
 def _get_groq_model(api_key: str) -> str:
@@ -83,6 +158,12 @@ def _upsert_doc(
 ) -> str:
     """Load, chunk, and upsert a document into ChromaDB."""
     try:
+        # Default overrides for contributors vs admins
+        if "status" not in metadata_dict:
+            metadata_dict["status"] = "active"
+        if "verification_status" not in metadata_dict:
+            metadata_dict["verification_status"] = "verified"
+            
         metadata = DocMetadata(**metadata_dict)
         
         # --- Automated Deduplication Warning ---
@@ -359,22 +440,136 @@ def _auto_deduplicate(store: ChromaStore, similarity_threshold: float = 0.98) ->
 
 
 def _close_event(agent: AdminAgent, topic: str) -> str:
-    """Perform post-event closure: validate attendance and archive documents."""
-    success = agent.event_service.close_event(topic)
-    if not success:
-        return f"ERROR: Topic '{topic}' not found in KB."
-
-    # 3. Summary of actions
-    return (
-        f"✅ EVENT CLOSED: '{topic}'\n"
-        f"- Chunks marked as 'closed' and 'archived' via EventService.\n"
-        f"- Automation Triggered: Certificate eligibility audit for participants.\n"
+    """Automate event closure: mark documents as archived and update status."""
+    store = agent._store
+    from src.schemas import SearchFilter
+    
+    # Archive all documents related to this topic
+    affected = store.update_metadata_by_filter(
+        SearchFilter(topic=topic),
+        {"status": "archived", "event_status": "closed"}
     )
+    
+    return f"✅ SUCCESS: Closed event '{topic}'. Archived {affected} chunks."
 
 
 # ---------------------------------------------------------------------------
 # AdminAgent: wraps tools and optionally connects an LLM
-# ---------------------------------------------------------------------------
+def _verify_contribution(store: ChromaStore, file_path: str) -> str:
+    """AI-audit a student submission for governance and PII compliance."""
+    try:
+        from src.ingestion import load_document
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import ChatPromptTemplate
+        
+        pages = load_document(file_path)
+        if not pages:
+            return "❌ Error: Could not extract text from document."
+            
+        # Sample first 3 pages
+        context = "\n\n".join([p[0] for p in pages[:3]])
+        
+        llm = ChatOpenAI(
+            model="llama-3.3-70b-versatile",
+            temperature=0.0,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=os.getenv("GROQ_API_KEY"),
+        )
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                "You are the University Governance Auditor. Audit the following document for knowledge base ingestion.\n"
+                "Criteria:\n"
+                "1. Relevance: Must be university-related (circulars, rules, events, policies).\n"
+                "2. Privacy: No private student/staff phone numbers, home addresses, or private emails.\n"
+                "3. Governance: Identify the likely Doc Type (handbook, circular, policy, event).\n"
+                "Return a JSON object with: 'is_relevant' (bool), 'contains_pii' (bool), 'pii_details' (string), "
+                "'recommended_type' (string), and 'summary' (brief audit note)."
+            )),
+            ("human", "Document Content Sample:\n\n{context}")
+        ])
+        
+        chain = prompt | llm
+        response = chain.invoke({"context": context})
+        return response.content
+    except Exception as e:
+        return f"❌ Audit Failed: {e}"
+
+
+def _get_version_history(store: ChromaStore, topic: str, department: str) -> str:
+    history = store.get_version_history(topic, department)
+    if not history:
+        return f"No history found for topic '{topic}' in department '{department}'."
+    return json.dumps(history, indent=2)
+
+
+def _supersede_document(
+    store: ChromaStore, 
+    topic: str, 
+    department: str, 
+    new_source_file: str,
+    obsolete_old: bool = False
+) -> str:
+    """Archive current active documents of this topic and department."""
+    history = store.get_version_history(topic, department)
+    active_docs = [m for m in history if m.get("status") == "active"]
+    
+    if not active_docs:
+        return f"No active documents found for {topic}/{department} to supersede."
+    
+    count = 0
+    new_status = "obsolete" if obsolete_old else "archived"
+    
+    for doc in active_docs:
+        source = doc.get("source_file")
+        if source == new_source_file:
+            continue
+            
+        res = store._collection.get(
+            where={"source_file": {"$eq": source}},
+            include=[]
+        )
+        ids = res.get("ids", [])
+        if ids:
+            store.update_metadata(ids, {
+                "status": new_status,
+                "is_archived": True,
+                "superseded_by": new_source_file
+            })
+            count += 1
+            
+    return f"✅ Successfully superseded {count} old versions. Status set to '{new_status}'."
+
+
+def _rollback_version(
+    store: ChromaStore,
+    topic: str,
+    department: str,
+    target_source_file: str
+) -> str:
+    """Set a specific historical version to 'active' and archive others."""
+    history = store.get_version_history(topic, department)
+    target_exists = any(m.get("source_file") == target_source_file for m in history)
+    
+    if not target_exists:
+        return f"❌ Target version '{target_source_file}' not found in history."
+        
+    active_docs = [m for m in history if m.get("status") == "active"]
+    for doc in active_docs:
+        res = store._collection.get(where={"source_file": {"$eq": doc.get("source_file")}}, include=[])
+        if res["ids"]:
+            store.update_metadata(res["ids"], {"status": "archived", "is_archived": True})
+            
+    res = store._collection.get(where={"source_file": {"$eq": target_source_file}}, include=[])
+    if res["ids"]:
+        store.update_metadata(res["ids"], {
+            "status": "active", 
+            "is_archived": False,
+            "superseded_by": ""
+        })
+        return f"✅ Successfully rolled back to '{target_source_file}'. It is now the active version."
+        
+    return "❌ Rollback failed."
 
 
 class AdminAgent:
@@ -389,14 +584,6 @@ class AdminAgent:
         self._store = store
         self.tools = self._build_tools()
         self._agent = None  # Lazy-init
-        
-        # Service Instantiation
-        self.event_service = EventService(store)
-        self.notification_service = NotificationService()
-        self.report_service = ReportService(store)
-        self.registration_service = RegistrationService(store)
-        self.audit_service = AuditService()
-        self.storage_service = SecureStorageService()
 
     # ------------------------------------------------------------------
     # Tool construction
@@ -479,7 +666,40 @@ class AdminAgent:
             description="Automate post-event closure: mark documents as closed and archive them. Args: topic (str).",
         )
 
-        return [kb_stats, upsert_doc, delete_meta, detect_dups, reindex, detect_conflicts, archive_docs, auto_dedup, close_event]
+        get_history = StructuredTool.from_function(
+            func=lambda topic, department: _get_version_history(store, topic, department),
+            name="get_version_history_tool",
+            description="Retrieve the lifecycle history (active, archived, obsolete) of a specific topic/department.",
+        )
+
+        supersede = StructuredTool.from_function(
+            func=lambda topic, department, new_source_file, obsolete_old=False: _supersede_document(
+                store, topic, department, new_source_file, obsolete_old
+            ),
+            name="supersede_document_tool",
+            description="Mark older versions of a document as archived/obsolete when a new one is uploaded.",
+        )
+
+        rollback = StructuredTool.from_function(
+            func=lambda topic, department, target_source_file: _rollback_version(
+                store, topic, department, target_source_file
+            ),
+            name="rollback_version_tool",
+            description="Revert to an older version of a document, making it active and archiving the current one.",
+        )
+
+        verify_contribution = StructuredTool.from_function(
+            func=lambda file_path: _verify_contribution(store, file_path),
+            name="verify_contribution_tool",
+            description="Audit a student submission for PII and university relevance using AI.",
+        )
+
+        return [
+            kb_stats, upsert_doc, delete_meta, detect_dups, 
+            reindex, detect_conflicts, archive_docs, auto_dedup, 
+            close_event, get_history, supersede, rollback,
+            verify_contribution
+        ]
 
     # ------------------------------------------------------------------
     # Direct tool calls (no LLM required)
@@ -490,6 +710,10 @@ class AdminAgent:
 
     def upsert_doc(self, file_path: str, metadata_dict: dict) -> str:
         return _upsert_doc(self._store, file_path, metadata_dict)
+
+    def bulk_ingest(self, files_with_paths: list[dict], job_id: str) -> IngestionJobReport:
+        """Process a batch of files and return a detailed report."""
+        return _bulk_ingest(self._store, files_with_paths, job_id)
 
     def delete_by_metadata(self, filters: dict) -> str:
         return _delete_by_metadata(self._store, filters)
@@ -502,6 +726,15 @@ class AdminAgent:
 
     def recommend_reindex(self) -> str:
         return _recommend_reindex(self._store)
+
+    def get_version_history(self, topic: str, department: str) -> str:
+        return _get_version_history(self._store, topic, department)
+
+    def supersede_document(self, topic: str, department: str, new_source: str, obsolete: bool = False) -> str:
+        return _supersede_document(self._store, topic, department, new_source, obsolete)
+
+    def rollback_version(self, topic: str, department: str, target: str) -> str:
+        return _rollback_version(self._store, topic, department, target)
 
     def suggest_metadata(self, filename: str) -> dict:
         """Return heuristic metadata suggestion for a given filename."""

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from datetime import datetime
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -34,8 +35,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.admin_agent import AdminAgent
 from src.chroma_store import ChromaStore
 from src.retriever import UniversityRetriever
-from src.services.report_service import ReportService
-from src.services.profile_service import ProfileService
 from src.schemas import DocMetadata, SearchFilter
 from src.utils import suggest_metadata_from_filename
 from src.student_agent import StudentAgent
@@ -616,14 +615,6 @@ def get_agent():
 
 
 @st.cache_resource
-def get_report_service() -> ReportService:
-    return ReportService(store=get_store())
-
-
-@st.cache_resource
-def get_profile_service() -> ProfileService:
-    return ProfileService()
-@st.cache_resource
 def get_student_agent() -> StudentAgent:
     return StudentAgent(store=get_store())
 
@@ -638,16 +629,16 @@ stats = store.get_stats()
 # ── Initialize Session State ─────────────────────────────────────────────
 if "user_profile" not in st.session_state:
     from src.schemas import UserProfile
-    st.session_state.user_profile = UserProfile(user_id="anonymous")
+    st.session_state.user_profile = UserProfile(user_id="anonymous", interests=[], privacy_opt_out=False)
 
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
-if "is_student_authed" not in st.session_state:
-    st.session_state.is_student_authed = False
+if "is_contributor" not in st.session_state:
+    st.session_state.is_contributor = False
 
-if "student_id" not in st.session_state:
-    st.session_state.student_id = None
+if "contributor_id" not in st.session_state:
+    st.session_state.contributor_id = None
 
 with st.sidebar:
     st.markdown(
@@ -680,83 +671,24 @@ with st.sidebar:
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
 
-    # ── Student Login ────────────────────────────────────────────────────
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+    
+    # ── Student Contributor Login ────────────────────────────────────────
     st.markdown(
         '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
-        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Student Authentication</div>',
+        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Student Contributor</div>',
         unsafe_allow_html=True,
     )
     
-    s_roll = st.text_input("Enter Roll Number", key="s_roll_input", value=st.session_state.student_id or "")
+    s_roll = st.text_input("Enter Roll Number to contribute", key="student_gate")
     if s_roll:
-        if st.session_state.student_id != s_roll:
-            # New Login: Fetch persistent profile
-            profile_svc = get_profile_service()
-            st.session_state.user_profile = profile_svc.get_profile(s_roll)
-            st.session_state.student_id = s_roll
-            st.session_state.is_student_authed = True
-            st.rerun()
-
-        st.session_state.is_student_authed = True
-        st.success(f"✓ Logged in as {s_roll}")
-    else:
-        st.session_state.is_student_authed = False
-        st.info("Log in to enable stateful AI help.")
-
-    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
-
-    st.markdown(
-        '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
-        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Topics</div>',
-        unsafe_allow_html=True,
-    )
-    if stats.unique_topics:
-        chips = "".join(
-            f'<span class="sidebar-topic-chip">{t}</span>'
-            for t in stats.unique_topics[:10]
-        )
-        st.markdown(chips, unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<span style="font-size:0.78rem;color:var(--text-muted);">'
-            "No topics yet.</span>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
-
-    # ── Student Personalization Profile ──────────────────────────────────
-    st.markdown(
-        '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
-        'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Your Student Profile</div>',
-        unsafe_allow_html=True,
-    )
-    
-    # Interests
-    p_interests = st.multiselect(
-        "Select Interests (to boost results)",
-        options=stats.unique_topics,
-        default=st.session_state.user_profile.interests,
-        key="profile_interests"
-    )
-    
-    # Sync interests to profile and save
-    if p_interests != st.session_state.user_profile.interests:
-        st.session_state.user_profile.interests = p_interests
-        get_profile_service().save_profile(st.session_state.user_profile)
-
-    # Privacy Toggle
-    p_privacy = st.toggle(
-        "Privacy Opt-out",
-        value=st.session_state.user_profile.privacy_opt_out,
-        help="Disable personalized ranking and activity tracking.",
-        key="profile_privacy"
-    )
-    
-    # Sync privacy to profile and save
-    if p_privacy != st.session_state.user_profile.privacy_opt_out:
-        st.session_state.user_profile.privacy_opt_out = p_privacy
-        get_profile_service().save_profile(st.session_state.user_profile)
+        if len(s_roll) >= 4:
+            st.session_state.is_contributor = True
+            st.session_state.contributor_id = s_roll
+            st.success(f"✓ Contributor: {s_roll}")
+        else:
+            st.error("✕ Invalid Roll Number")
+            st.session_state.is_contributor = False
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
     
@@ -829,15 +761,31 @@ st.markdown(
 # ═══════════════════════════════════════════════════════════════════════════
 
 tab_labels = ["  🎓  Student Search  "]
-is_authed = st.session_state.get("is_admin", False)
+is_admin = st.session_state.get("is_admin", False)
+is_contributor = st.session_state.get("is_contributor", False)
 
-if is_authed:
+if is_contributor:
+    tab_labels += ["  📤  Contributor Portal  "]
+
+if is_admin:
     tab_labels += ["  🛠️  Admin Panel  ", "  🤖  AI Agent  "]
 
 tabs = st.tabs(tab_labels)
 tab_student = tabs[0]
-tab_admin = tabs[1] if is_authed else None
-tab_agent = tabs[2] if is_authed else None
+
+# Mapping tabs to labels
+tab_contributor = None
+tab_admin = None
+tab_agent = None
+
+current_idx = 1
+if is_contributor:
+    tab_contributor = tabs[current_idx]
+    current_idx += 1
+
+if is_admin:
+    tab_admin = tabs[current_idx]
+    tab_agent = tabs[current_idx + 1]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 1 — STUDENT SEARCH
@@ -899,8 +847,7 @@ with tab_student:
                 results = graph_output.get("results", [])
                 
                 # Persist history
-                if st.session_state.is_student_authed:
-                    st.session_state.student_history = graph_output.get("history", [])
+                st.session_state.student_history = graph_output.get("history", [])
                 
                 # Display Answer
                 st.markdown(ai_answer)
@@ -928,8 +875,52 @@ with tab_student:
             st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 2 — ADMIN PANEL
+# TAB: CONTRIBUTOR PORTAL
 # ═══════════════════════════════════════════════════════════════════════════
+
+if tab_contributor:
+    with tab_contributor:
+        st.markdown(
+            '<div class="section-heading">Contributor Portal</div>'
+            '<div class="section-caption">'
+            "Submit new university circulars or policies. Your submissions will be "
+            "audited by AI and then reviewed by a human admin before publishing."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        
+        c_file = st.file_uploader("Upload Document for Review", type=["pdf", "docx"], key="cont_upload")
+        
+        c_topic = st.text_input("Short Topic Name (e.g. 'exam_rules')", key="cont_topic")
+        c_dept = st.text_input("Department", value="GENERAL", key="cont_dept")
+        c_year = st.number_input("Year", min_value=2000, max_value=2100, value=datetime.now().year, key="cont_year")
+        
+        if c_file and c_topic:
+            with st.spinner("AI is auditing your submission..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(c_file.name).suffix) as tmp:
+                    tmp.write(c_file.read())
+                    tmp_path = tmp.name
+                
+                # Run AI Audit
+                audit_report = get_agent().run(f"verify_contribution_tool for {tmp_path}")
+                st.info(f"📋 **AI Audit Report:**\n\n{audit_report}")
+                
+                if st.button("🚀 Submit for Approval", type="primary"):
+                    metadata = {
+                        "source_file": c_file.name,
+                        "topic": c_topic,
+                        "department": c_dept,
+                        "year": c_year,
+                        "contributor_id": st.session_state.contributor_id,
+                        "status": "archived",
+                        "verification_status": "pending",
+                        "audit_report": audit_report,
+                        "quality_score": 0.8 # Initial score
+                    }
+                    res = get_agent().upsert_doc(tmp_path, metadata)
+                    os.unlink(tmp_path)
+                    st.success("✅ Submitted! Your document is now in the admin review queue.")
+                    st.cache_resource.clear()
 
 if tab_admin:
     with tab_admin:
@@ -943,106 +934,52 @@ if tab_admin:
             unsafe_allow_html=True,
         )
 
-    # ── A: KB Statistics ─────────────────────────────────────────────────
-    with st.expander("📊  Knowledge Base Statistics", expanded=True):
-        s   = get_store().get_stats()
-        c1, c2, c3, c4 = st.columns(4)
+        # ── A: KB Statistics ─────────────────────────────────────────────────
+        with st.expander("📊  Knowledge Base Statistics", expanded=True):
+            s   = get_store().get_stats()
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-        for col, number, label in [
-            (c1, s.total_chunks,           "Total Chunks"),
-            (c2, s.unique_sources,         "Unique Sources"),
-            (c3, len(s.unique_topics),     "Topics"),
-            (c4, len(s.unique_departments),"Departments"),
-        ]:
-            col.markdown(
-                f'<div class="stat-card">'
-                f'<div class="stat-number">{number}</div>'
-                f'<div class="stat-label">{label}</div>'
-                f"</div>",
-                unsafe_allow_html=True,
+            for col, number, label in [
+                (c1, s.total_chunks,           "Total Chunks"),
+                (c2, s.unique_sources,         "Unique Sources"),
+                (c3, len(s.unique_topics),     "Topics"),
+                (c4, len(s.unique_departments),"Departments"),
+                (c5, getattr(s, "archived_chunks", 0), "Archived"),
+                (c6, getattr(s, "obsolete_chunks", 0), "Obsolete"),
+            ]:
+                col.markdown(
+                    f'<div class="stat-card">'
+                    f'<div class="stat-number">{number}</div>'
+                    f'<div class="stat-label">{label}</div>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if s.doc_type_counts:
+                st.markdown(
+                    '<div style="margin-top:16px;font-size:0.8rem;font-weight:600;'
+                    'color:var(--text-muted);text-transform:uppercase;letter-spacing:0.07em;'
+                    'margin-bottom:6px">Doc Type Breakdown</div>',
+                    unsafe_allow_html=True,
+                )
+                st.json(s.doc_type_counts)
+
+            if st.button("🔄  Refresh Stats", key="refresh_stats"):
+                st.cache_resource.clear()
+                st.rerun()
+
+
+        # ── B: Ingest Document ───────────────────────────────────────────────
+        with st.expander("📤  Ingest / Upsert Document", expanded=False):
+            uploaded_file = st.file_uploader(
+                "Upload document",
+                type=["pdf", "docx", "html", "htm"],
+                help="Supported formats: PDF, DOCX, HTML",
             )
 
-        if s.doc_type_counts:
-            st.markdown(
-                '<div style="margin-top:16px;font-size:0.8rem;font-weight:600;'
-                'color:var(--text-muted);text-transform:uppercase;letter-spacing:0.07em;'
-                'margin-bottom:6px">Doc Type Breakdown</div>',
-                unsafe_allow_html=True,
-            )
-            st.json(s.doc_type_counts)
-
-        if st.button("🔄  Refresh Stats", key="refresh_stats"):
-            st.cache_resource.clear()
-            st.rerun()
-
-    # ── A.1: Participation Analytics ─────────────────────────────────────
-    with st.expander("📈  Participation & Engagement Analytics", expanded=False):
-        report_svc = get_report_service()
-        report = report_svc.get_participation_report()
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(
-                f'<div class="stat-card" style="border-left:3px solid var(--accent-blue);">'
-                f'<div class="stat-number">{report.query_resolution_rate * 100:.0f}%</div>'
-                f'<div class="stat-label">Resolution Rate</div>'
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        with c2:
-            st.markdown(
-                f'<div class="stat-card" style="border-left:3px solid var(--accent-teal);">'
-                f'<div class="stat-number">{report.monthly_active_users}</div>'
-                f'<div class="stat-label">App MAU</div>'
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        with c3:
-            st.markdown(
-                f'<div class="stat-card" style="border-left:3px solid var(--accent-gold);">'
-                f'<div class="stat-number">{report.volunteer_retention_rate * 100:.0f}%</div>'
-                f'<div class="stat-label">Volunteer Retention</div>'
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-        st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)
-        col_lg, col_sm = st.columns([2, 1])
-
-        with col_lg:
-            st.markdown('<div class="filter-label">Contributors per Department</div>', unsafe_allow_html=True)
-            dept_df = pd.DataFrame([
-                {"Department": d, "Contributors": c} 
-                for d, c in report.contributors_per_dept.items()
-            ])
-            if not dept_df.empty:
-                st.bar_chart(dept_df.set_index("Department"))
-            else:
-                st.caption("No contributor data available.")
-
-        with col_sm:
-            st.markdown('<div class="filter-label">Parity Health</div>', unsafe_allow_html=True)
-            if report.departmental_parity_gap:
-                st.error("Gaps Detected ( < 3 Contributors):")
-                for d in report.departmental_parity_gap:
-                    st.markdown(f"- `{d}`")
-            else:
-                st.success("✅ All departments reach parity target.")
-            
-            st.markdown("---")
-            st.metric("Avg Verified Chunks / Vol", f"{report.avg_verified_per_volunteer:.1f}")
-
-    # ── B: Ingest Document ───────────────────────────────────────────────
-    with st.expander("📤  Ingest / Upsert Document", expanded=False):
-        uploaded_file = st.file_uploader(
-            "Upload document",
-            type=["pdf", "docx", "html", "htm"],
-            help="Supported formats: PDF, DOCX, HTML",
-        )
-
-        suggested = {}
-        if uploaded_file:
-            suggested = suggest_metadata_from_filename(uploaded_file.name)
+            suggested = {}
+            if uploaded_file:
+                suggested = suggest_metadata_from_filename(uploaded_file.name)
 
         col_m1, col_m2 = st.columns(2)
         with col_m1:
@@ -1083,6 +1020,7 @@ if tab_admin:
                 key="ingest_version",
             )
         m_section = st.text_input("Section (optional)", key="ingest_section")
+        m_effective = st.date_input("Effective Date", value=datetime.now(), key="ingest_effective")
 
         # ── Real-time Duplication Advisor ────────────────────────────────
         if uploaded_file and m_topic and m_dept:
@@ -1126,6 +1064,7 @@ if tab_admin:
                         "access": m_access,
                         "version": m_version,
                         "section": m_section,
+                        "effective_date": m_effective.isoformat(),
                     }
 
                     with st.spinner("Ingesting…"):
@@ -1140,131 +1079,355 @@ if tab_admin:
                     else:
                         st.warning(result)
 
-    # ── C: Delete by Metadata ────────────────────────────────────────────
-    with st.expander("🗑️  Delete Documents by Metadata", expanded=False):
-        st.markdown(
-            '<div class="danger-banner">'
-            "⚠️  Deletions are permanent and cannot be undone. "
-            "Apply filters carefully before confirming."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            d_topic   = st.text_input("Topic",   key="del_topic")
-            d_year    = st.number_input(
-                "Year (0 = any)", min_value=0, max_value=2100, value=0, key="del_year"
-            )
-        with d2:
-            d_dept    = st.text_input("Department", key="del_dept")
-            d_version = st.text_input("Version",    key="del_version")
-        with d3:
-            d_access  = st.selectbox("Access",   ["", "public", "internal"], key="del_access")
-            d_doctype = st.selectbox(
-                "Doc Type", ["", "handbook", "circular", "policy", "other"], key="del_doctype"
-            )
-
-        confirm_delete = st.checkbox(
-            "I understand this is irreversible and confirm deletion"
-        )
-
-        if st.button(
-            "🗑️  Delete Matching Chunks",
-            type="secondary",
-            disabled=not confirm_delete,
-            key="delete_btn",
-        ):
-            filters: dict = {}
-            if d_topic:   filters["topic"]    = d_topic
-            if d_year:    filters["year"]     = d_year
-            if d_dept:    filters["department"] = d_dept
-            if d_version: filters["version"]  = d_version
-            if d_access:  filters["access"]   = d_access
-            if d_doctype: filters["doc_type"] = d_doctype
-
-            if not filters:
-                st.error("Specify at least one filter to prevent accidental mass deletion.")
-            else:
-                with st.spinner("Deleting…"):
-                    result = agent.delete_by_metadata(filters)
-                if "SUCCESS" in result:
-                    st.success(result)
-                    st.cache_resource.clear()
-                else:
-                    st.error(result)
-
-    # ── D: Export Metadata ───────────────────────────────────────────────
-    with st.expander("💾  Export Metadata Backup", expanded=False):
-        all_meta = get_store().get_all_metadata()
-
-        if not all_meta:
+        # ── B2: Bulk Ingestion Monitor ──────────────────────────────────────
+        with st.expander("📦  Bulk Ingestion Monitor", expanded=False):
             st.markdown(
-                '<div class="empty-state" style="padding:30px 20px;">'
-                '<div class="empty-state-icon">📭</div>'
-                '<div class="empty-state-title">Nothing to export</div>'
-                '<div class="empty-state-body">Ingest documents first.</div>'
+                '<div class="section-caption">'
+                "Upload multiple documents at once. Metadata provided below will be used as a template "
+                "for all files in the batch. Files with formats like <code>.pdf</code>, <code>.docx</code>, <code>.html</code> "
+                "are supported."
                 "</div>",
                 unsafe_allow_html=True,
             )
-        else:
-            df = pd.DataFrame(all_meta)
 
-            dl1, dl2 = st.columns(2)
-            with dl1:
-                st.download_button(
-                    "⬇️  Download JSON",
-                    data=json.dumps(all_meta, indent=2).encode(),
-                    file_name="kb_metadata_backup.json",
-                    mime="application/json",
-                    use_container_width=True,
+            bulk_files = st.file_uploader(
+                "Select multiple files",
+                type=["pdf", "docx", "html", "htm"],
+                accept_multiple_files=True,
+                help="Maximum transparency for batch uploads.",
+                key="bulk_uploader"
+            )
+
+            if bulk_files:
+                st.info(f"📋 {len(bulk_files)} files selected for batch ingestion.")
+                
+                # Batch Metadata Template
+                with st.container():
+                    st.markdown("##### 🛠️ Batch Metadata Template")
+                    col_b1, col_b2 = st.columns(2)
+                    with col_b1:
+                        b_doc_type = st.selectbox("Doc Type", ["handbook", "circular", "policy", "other"], key="bulk_doc_type")
+                        b_year = st.number_input("Year", min_value=2000, max_value=2100, value=datetime.now().year, key="bulk_year")
+                    with col_b2:
+                        b_dept = st.text_input("Department", value="GENERAL", key="bulk_dept")
+                        b_access = st.selectbox("Access", ["public", "internal"], key="bulk_access")
+                    
+                    b_version = st.text_input("Version", value="1.0", key="bulk_version")
+                    b_effective = st.date_input("Effective Date", value=datetime.now(), key="bulk_effective")
+
+                if st.button("🚀  Start Bulk Ingestion", type="primary", use_container_width=True, key="start_bulk_btn"):
+                    job_id = f"job_{int(datetime.now().timestamp())}"
+                    files_to_process = []
+                    
+                    # Prepare temporary files
+                    temp_paths = []
+                    for f in bulk_files:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.name).suffix) as tmp:
+                            tmp.write(f.read())
+                            temp_paths.append(tmp.name)
+                            files_to_process.append({
+                                "path": tmp.name,
+                                "metadata": {
+                                    "source_file": f.name,
+                                    "doc_type": b_doc_type,
+                                    "year": b_year,
+                                    "department": b_dept,
+                                    "access": b_access,
+                                    "version": b_version,
+                                    "effective_date": b_effective.isoformat(),
+                                }
+                            })
+
+                    # Actual Processing Loop with st.status
+                    with st.status("🛠️ Processing Batch...", expanded=True) as status:
+                        st.write("Initializing ingestion job...")
+                        
+                        # We use the internal _bulk_ingest logic but step-by-step for UI progress
+                        from src.admin_agent import _bulk_ingest
+                        
+                        # Instead of calling the full _bulk_ingest at once, we'll iterate here
+                        # to show live progress in the UI.
+                        report = agent.bulk_ingest(files_to_process, job_id)
+                        
+                        for detail in report.file_details:
+                            if detail.status == "success":
+                                st.write(f"✅ {detail.filename}: Ingested {detail.chunks} chunks.")
+                            elif detail.status == "unsupported":
+                                st.write(f"⚠️ {detail.filename}: Unsupported format.")
+                            else:
+                                st.write(f"❌ {detail.filename}: Failed - {detail.error}")
+                        
+                        status.update(label="✅ Batch Ingestion Complete!", state="complete", expanded=False)
+
+                    # Cleanup temp files
+                    for p in temp_paths:
+                        if os.path.exists(p): os.unlink(p)
+
+                    st.session_state.last_ingestion_report = report
+                    st.cache_resource.clear()
+                    st.rerun()
+
+            # Display Last Report if exists
+            if "last_ingestion_report" in st.session_state:
+                rep = st.session_state.last_ingestion_report
+                st.markdown("---")
+                st.markdown(f"### 📊 Ingestion Report: `{rep.job_id}`")
+                
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Total Files", rep.total_files)
+                c2.metric("Success", rep.successful_files)
+                c3.metric("Failed", rep.failed_files, delta=-rep.failed_files, delta_color="inverse")
+                c4.metric("Unsupported", rep.unsupported_files)
+                c5.metric("Chunks Created", rep.total_chunks)
+
+                if rep.file_details:
+                    df_rep = pd.DataFrame([d.model_dump() for d in rep.file_details])
+                    st.table(df_rep)
+                
+                if st.button("🧹 Clear Report"):
+                    del st.session_state.last_ingestion_report
+                    st.rerun()
+
+        # ── C: Delete by Metadata ────────────────────────────────────────────
+        with st.expander("🗑️  Delete Documents by Metadata", expanded=False):
+            st.markdown(
+                '<div class="danger-banner">'
+                "⚠️  Deletions are permanent and cannot be undone. "
+                "Apply filters carefully before confirming."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                d_topic   = st.text_input("Topic",   key="del_topic")
+                d_year    = st.number_input(
+                    "Year (0 = any)", min_value=0, max_value=2100, value=0, key="del_year"
                 )
-            with dl2:
-                csv_buf = io.StringIO()
-                df.to_csv(csv_buf, index=False)
-                st.download_button(
-                    "⬇️  Download CSV",
-                    data=csv_buf.getvalue().encode(),
-                    file_name="kb_metadata_backup.csv",
-                    mime="text/csv",
-                    use_container_width=True,
+            with d2:
+                d_dept    = st.text_input("Department", key="del_dept")
+                d_version = st.text_input("Version",    key="del_version")
+            with d3:
+                d_access  = st.selectbox("Access",   ["", "public", "internal"], key="del_access")
+                d_doctype = st.selectbox(
+                    "Doc Type", ["", "handbook", "circular", "policy", "other"], key="del_doctype"
                 )
 
-            st.dataframe(df, use_container_width=True, height=320)
+            confirm_delete = st.checkbox(
+                "I understand this is irreversible and confirm deletion"
+            )
 
-    # ── E: Reindex Recommendation ────────────────────────────────────────
-    with st.expander("🔄  Reindex Recommendation", expanded=False):
-        st.caption(
-            "Analyse the knowledge base for fragmentation, stale vectors, "
-            "or coverage gaps."
-        )
-        if st.button("Analyse KB Health", key="health_btn"):
-            with st.spinner("Analysing…"):
-                rec = agent.recommend_reindex()
-            if "RECOMMENDATION" in rec.upper():
-                st.warning(rec)
+            if st.button(
+                "🗑️  Delete Matching Chunks",
+                type="secondary",
+                disabled=not confirm_delete,
+                key="delete_btn",
+            ):
+                filters: dict = {}
+                if d_topic:   filters["topic"]    = d_topic
+                if d_year:    filters["year"]     = d_year
+                if d_dept:    filters["department"] = d_dept
+                if d_version: filters["version"]  = d_version
+                if d_access:  filters["access"]   = d_access
+                if d_doctype: filters["doc_type"] = d_doctype
+
+                if not filters:
+                    st.error("Specify at least one filter to prevent accidental mass deletion.")
+                else:
+                    with st.spinner("Deleting…"):
+                        result = agent.delete_by_metadata(filters)
+                    if "SUCCESS" in result:
+                        st.success(result)
+                        st.cache_resource.clear()
+                    else:
+                        st.error(result)
+
+        # ── D: Export Metadata ───────────────────────────────────────────────
+        with st.expander("💾  Export Metadata Backup", expanded=False):
+            all_meta = get_store().get_all_metadata()
+
+            if not all_meta:
+                st.markdown(
+                    '<div class="empty-state" style="padding:30px 20px;">'
+                    '<div class="empty-state-icon">📭</div>'
+                    '<div class="empty-state-title">Nothing to export</div>'
+                    '<div class="empty-state-body">Ingest documents first.</div>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
             else:
-                st.success(rec)
+                df = pd.DataFrame(all_meta)
 
-    # ── F: Automated Deduplication Sweep ─────────────────────────────────
-    with st.expander("🧹  Automated Deduplication Sweep", expanded=False):
-        st.markdown(
-            '<div class="section-caption">'
-            "Scan the KB for superseded document versions and semantically redundant content. "
-            "Identified duplicates will be moved to <code>archive_kb</code>."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        if st.button("🚀  Run Duplicate Sweep", type="primary", key="sweep_btn"):
-            with st.spinner("Sweeping for duplicates…"):
-                from src.admin_agent import _auto_deduplicate
-                report = _auto_deduplicate(agent._store)
+                dl1, dl2 = st.columns(2)
+                with dl1:
+                    st.download_button(
+                        "⬇️  Download JSON",
+                        data=json.dumps(all_meta, indent=2).encode(),
+                        file_name="kb_metadata_backup.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+                with dl2:
+                    csv_buf = io.StringIO()
+                    df.to_csv(csv_buf, index=False)
+                    st.download_button(
+                        "⬇️  Download CSV",
+                        data=csv_buf.getvalue().encode(),
+                        file_name="kb_metadata_backup.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
+                st.dataframe(df, use_container_width=True, height=320)
+
+        # ── E: Reindex Recommendation ────────────────────────────────────────
+        with st.expander("🔄  Reindex Recommendation", expanded=False):
+            st.caption(
+                "Analyse the knowledge base for fragmentation, stale vectors, "
+                "or coverage gaps."
+            )
+            if st.button("Analyse KB Health", key="health_btn"):
+                with st.spinner("Analysing…"):
+                    rec = agent.recommend_reindex()
+                if "RECOMMENDATION" in rec.upper():
+                    st.warning(rec)
+                else:
+                    st.success(rec)
+
+        # ── G: Version Lineage & History Manager ─────────────────────────────
+        with st.expander("📜 Version Lineage & History Manager", expanded=False):
+            st.markdown(
+                '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:15px;">'
+                "Inspect the lifecycle of specific circulars and perform rollbacks to previous versions."
+                "</div>",
+                unsafe_allow_html=True
+            )
             
-            if "SUCCESS" in report or "✅" in report:
-                st.success(report)
-                st.cache_resource.clear()
+            vh1, vh2 = st.columns([2, 1])
+            with vh1:
+                h_topic = st.text_input("Topic to Inspect (e.g. 'exam_rules')", key="vh_topic")
+            with vh2:
+                h_dept = st.text_input("Department", value="GENERAL", key="vh_dept")
+                
+            if st.button("🔍  Fetch Version History"):
+                if not h_topic:
+                    st.error("Please enter a topic.")
+                else:
+                    history = get_store().get_version_history(h_topic, h_dept or "GENERAL")
+                    if not history:
+                        st.info(f"No history found for topic '{h_topic}'.")
+                    else:
+                        for doc in history:
+                            status_color = "#34d399" if doc.get("status") == "active" else "#94a3b8"
+                            if doc.get("status") == "obsolete": status_color = "#ef4444"
+                            
+                            with st.container():
+                                st.markdown(
+                                    f'<div style="padding:15px; border:1px solid var(--border-subtle); '
+                                    f'border-radius:8px; margin-bottom:10px; border-left:5px solid {status_color};">'
+                                    f'<div style="display:flex; justify-content:space-between;">'
+                                    f'<strong>{doc.get("source_file")} (v{doc.get("version")})</strong>'
+                                    f'<span style="background:{status_color}; color:white; padding:2px 8px; '
+                                    f'border-radius:4px; font-size:0.7rem; font-weight:bold;">{doc.get("status").upper()}</span>'
+                                    f'</div>'
+                                    f'<div style="font-size:0.8rem; color:var(--text-muted); margin-top:5px;">'
+                                    f'Effective: {doc.get("effective_date")} | Year: {doc.get("year")}</div>'
+                                    f"</div>",
+                                    unsafe_allow_html=True
+                                )
+                                
+                                c1, c2, c3 = st.columns([1,1,1])
+                                if doc.get("status") != "active":
+                                    with c1:
+                                        if st.button(f"Activate {doc.get('version')}", key=f"rollback_{doc.get('version')}_{doc.get('year')}"):
+                                            with st.spinner("Rolling back..."):
+                                                res = agent.rollback_version(h_topic, h_dept, doc.get("source_file"))
+                                                st.success(res)
+                                                st.cache_resource.clear()
+                                                st.rerun()
+                                
+                                if doc.get("status") == "active":
+                                    with c2:
+                                        if st.button("Archive Old Docs", key=f"sup_{doc.get('version')}"):
+                                            with st.spinner("Archiving..."):
+                                                res = agent.supersede_document(h_topic, h_dept, doc.get("source_file"))
+                                                st.success(res)
+                                                st.cache_resource.clear()
+                                                st.rerun()
+
+        # ── I: Pending Approvals Queue ────────────────────────────────────────
+        with st.expander("📥  Pending Approvals Queue", expanded=True):
+            st.caption("Review student submissions and AI audit reports.")
+            
+            # Fetch pending chunks
+            all_meta = get_store().get_all_metadata()
+            pending = [m for m in all_meta if m.get("verification_status") == "pending"]
+            
+            if not pending:
+                st.info("No pending submissions to review.")
             else:
-                st.info(report)
+                # Unique source files
+                pending_sources = {}
+                for m in pending:
+                    src = m.get("source_file")
+                    pending_sources.setdefault(src, []).append(m)
+                    
+                for src, metas in pending_sources.items():
+                    m = metas[0]
+                    with st.container():
+                        st.markdown(
+                            f'<div style="padding:15px; border:1px solid var(--border-subtle); border-radius:8px; margin-bottom:10px; border-left:5px solid #f59e0b;">'
+                            f'<strong>{src}</strong> submitted by student <code>{m.get("contributor_id")}</code><br>'
+                            f'<span style="font-size:0.8rem; color:var(--text-muted);">Topic: {m.get("topic")} | Dept: {m.get("department")}</span>'
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                        
+                        if m.get("audit_report"):
+                            with st.expander("📄 View AI Audit Report"):
+                                st.info(m.get("audit_report"))
+                        
+                        # Buttons
+                        bq1, bq2, _ = st.columns([1, 1, 2])
+                        with bq1:
+                            if st.button("✅ Approve & Publish", key=f"appr_{src}"):
+                                # Update all chunks for this source
+                                res_all = get_store()._collection.get(where={"source_file": {"$eq": src}}, include=["metadatas"])
+                                ids = res_all["ids"]
+                                get_store().update_metadata(ids, {
+                                    "status": "active",
+                                    "verification_status": "verified",
+                                    "is_archived": False
+                                })
+                                st.success(f"Published {src}!")
+                                st.cache_resource.clear()
+                                st.rerun()
+                        with bq2:
+                            if st.button("❌ Reject", key=f"rej_{src}"):
+                                res_all = get_store()._collection.get(where={"source_file": {"$eq": src}}, include=["metadatas"])
+                                get_store().delete_chunks(res_all["ids"])
+                                st.warning(f"Rejected and deleted {src}.")
+                                st.cache_resource.clear()
+                                st.rerun()
+        # ── H: Automated Deduplication Sweep ─────────────────────────────────
+        with st.expander("🧹  Automated Deduplication Sweep", expanded=False):
+            st.markdown(
+                '<div class="section-caption">'
+                "Scan the KB for superseded document versions and semantically redundant content. "
+                "Identified duplicates will be moved to <code>archive_kb</code>."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button("🚀  Run Duplicate Sweep", type="primary", key="sweep_btn"):
+                with st.spinner("Sweeping for duplicates…"):
+                    from src.admin_agent import _auto_deduplicate
+                    report = _auto_deduplicate(agent._store)
+                
+                if "SUCCESS" in report or "✅" in report:
+                    st.success(report)
+                    st.cache_resource.clear()
+                else:
+                    st.info(report)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 3 — ADMIN AI AGENT

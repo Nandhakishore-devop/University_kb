@@ -28,6 +28,14 @@ class DocMetadata(BaseModel):
         "public", description="Visibility scope"
     )
     version: str = Field("1.0", description="Document version string")
+    status: Literal["active", "archived", "obsolete"] = Field(
+        "active", description="Lifecycle status"
+    )
+    effective_date: str = Field(
+        default_factory=lambda: datetime.utcnow().isoformat().split("T")[0],
+        description="Date document guidance takes effect"
+    )
+    superseded_by: Optional[str] = Field(None, description="ID of the document that replaced this one")
     uploaded_time: str = Field(
         default_factory=lambda: datetime.utcnow().isoformat(),
         description="ISO-8601 UTC upload timestamp",
@@ -37,8 +45,9 @@ class DocMetadata(BaseModel):
         "pending", description="Status of human verification"
     )
     verification_time: Optional[str] = Field(None, description="ISO-8601 timestamp of verification")
-    is_archived: bool = Field(False, description="Whether doc is in active or archive collection")
+    is_archived: bool = Field(False, description="Deprecated in favor of 'status'")
     quality_score: float = Field(1.0, description="Data quality score (0.0-1.0)")
+    audit_report: Optional[str] = Field(None, description="AI-generated audit summary for contributors")
     parent_doc_id: Optional[str] = Field(None, description="Reference to parent doc (for versioning/dedup)")
     
     # Event Operations
@@ -52,36 +61,13 @@ class DocMetadata(BaseModel):
         self.department = self.department.upper().strip()
         return self
 
-    def to_chroma_dict(self) -> dict:
-        """Return a flat dict suitable for ChromaDB metadata storage.
-
-        ChromaDB metadata values must be str | int | float | bool.
-        """
-        return {
-            "source_file": self.source_file,
-            "doc_type": self.doc_type,
-            "section": self.section,
-            "topic": self.topic,
-            "year": self.year,
-            "department": self.department,
-            "access": self.access,
-            "version": self.version,
-            "uploaded_time": self.uploaded_time,
-            "contributor_id": self.contributor_id,
-            "verification_status": self.verification_status,
-            "verification_time": self.verification_time or "",
-            "is_archived": self.is_archived,
-            "quality_score": self.quality_score,
-            "parent_doc_id": self.parent_doc_id or "",
-        }
-
 
 # ---------------------------------------------------------------------------
-# A single retrieved chunk with its score
+# Search / Chunk results
 # ---------------------------------------------------------------------------
 
 class ChunkRecord(BaseModel):
-    """One chunk returned from a similarity search."""
+    """A single retrieved document chunk with associated metadata and relevance score."""
 
     chunk_id: str
     content: str
@@ -106,6 +92,7 @@ class KBStats(BaseModel):
     verified_chunks: int = 0
     unique_contributors: int = 0
     archived_chunks: int = 0
+    obsolete_chunks: int = 0
 
 
 class ParticipationStats(BaseModel):
@@ -131,6 +118,7 @@ class SearchFilter(BaseModel):
     access: Optional[Literal["public", "internal"]] = None
     doc_type: Optional[str] = None
     version: Optional[str] = None
+    status: Optional[str] = None
     is_archived: Optional[bool] = None
     verification_status: Optional[str] = None
 
@@ -149,6 +137,8 @@ class SearchFilter(BaseModel):
             conditions.append({"doc_type": {"$eq": self.doc_type}})
         if self.version:
             conditions.append({"version": {"$eq": self.version}})
+        if self.status:
+            conditions.append({"status": {"$eq": self.status}})
         if self.is_archived is not None:
             conditions.append({"is_archived": {"$eq": self.is_archived}})
         if self.verification_status:
@@ -200,3 +190,29 @@ class AuditLog(BaseModel):
     action: str
     target_id: str
     details: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Bulk Ingestion Monitoring
+# ---------------------------------------------------------------------------
+
+class FileIngestionStatus(BaseModel):
+    """Tracks the outcome of a single file in a batch ingestion job."""
+    filename: str
+    status: Literal["success", "failed", "unsupported"]
+    chunks: int = 0
+    error: Optional[str] = None
+
+
+class IngestionJobReport(BaseModel):
+    """Aggregate statistics for a bulk ingestion job."""
+    job_id: str
+    start_time: str
+    end_time: Optional[str] = None
+    total_files: int
+    processed_files: int = 0
+    successful_files: int = 0
+    failed_files: int = 0
+    unsupported_files: int = 0
+    total_chunks: int = 0
+    file_details: list[FileIngestionStatus] = Field(default_factory=list)
