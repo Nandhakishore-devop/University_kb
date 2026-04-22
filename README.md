@@ -1,106 +1,86 @@
 # 🎓 University Knowledge Base (UKB)
-## Modern, Conversational, and Secure Document Intelligence
+## *Modern, AI-Governed, and Secure Document Intelligence*
 
-A state-of-the-art Knowledge Base platform for universities, featuring a **LangGraph-powered Student Chatbot** and a **Robust AI Administrative Assistant**. The system leverages **ChromaDB** for vector storage, **Groq** for high-speed inference, and **Streamlit** for a premium user experience.
-
----
-
-## 🌟 Key Pillars
-
-### 🤖 1. Student Campus Chatbot (LangGraph)
-*   **Conversational Logic**: Not just a search bar, but a stateful AI assistant that remembers conversation context.
-*   **Verified Sources**: Every answer is backed by document citations available in expandable "Verified Sources" blocks.
-*   **Persistent Profiles**: Student interests (e.g., "Scholarships", "Campus Life") persist across sessions via a secure JSON profile layer.
-
-### 🛡️ 2. Robust Admin AI Agent
-*   **Triple-Layer Execution**: Guaranteed tool execution using a fallback chain: LangGraph ReAct → Legacy AgentExecutor → Manual ReAct Orchestration.
-*   **Super-Admin Identity**: Confidently manages the KB with natural language: *"Show stats"*, *"Delete all 2022 exam rules"*, *"Scan for duplicates"*.
-*   **Diagnostic Visibility**: Built-in "Agent Logs" viewer for real-time traceability of AI thought processes.
-
-### 📊 3. Modern Infrastructure
-*   **Hybrid Search**: High-performance vector search (ChromaDB) with metadata filtering (Topic, Dept, Year).
-*   **Audit & Analytics**: Transparent administrative action logging and engagement metrics (Resolution Rate, AVG Chunks).
-*   **Secure Access**: Partitioned access with Student ID authentication and Admin Secret protection.
+The **University Knowledge Base (UKB)** is a state-of-the-art RAG platform designed to serve as the unified source of truth for campus rules, policies, and circulars. It features a tri-tier integrity system that prevents contradictions, redundant document processing with real-time feedback, and a secure multi-role ecosystem for Students, Contributors, and Administrators.
 
 ---
 
-## 📂 Project Structure
+## 🚀 Key Features
+
+### 🛡️ AI Integrity Guardrails
+The UKB features a sophisticated three-tier safety system to ensure every document ingested is unique and consistent:
+*   **Tier 1: Duplicate Prevention**: Prevents redundant uploads by calculating document-level similarity scores (Blocking matches >75%).
+*   **Tier 2: Semantic Overlap Analysis**: Warns administrators when a new document covers existing topic areas, suggesting consolidation.
+*   **Tier 3: AI Contradiction Auditor**: Uses **Groq LLM** to deep-scan for factual conflicts (e.g., fee mismatches or rule changes) across departments and years.
+
+### 👥 Multi-Role Ecosystem
+*   **Student Hub**: A high-speed, personalized chatbot using **LangGraph** to provide cited answers to campus queries.
+*   **Contributor Portal**: Allows student contributors to submit circulars for review. Includes instant AI auto-metadata extraction and audit reports.
+*   **Admin Command Center**: Feature-rich dashboard for bulk ingestion (with streaming progress bars), version management (Supersede/Rollback), and a pending approval queue.
+
+### 🔐 Exclusive Security Architecture
+*   **Role-Locking**: Sidebars and input fields are dynamically disabled based on active sessions to prevent permission leakage.
+*   **Isolated Sessions**: Switching between Admin and Contributor roles automatically clears sensitive states, ensuring a clean audit trail.
+*   **Visibility Gates**: "Pending" submissions are indexed but remain invisible to the public chatbot until verified by a human administrator.
+
+---
+
+## 🛠️ Technology Stack
+*   **Language**: Python 3.10+
+*   **Framework**: [Streamlit](https://streamlit.io/) (Premium Dark Mode Aesthetics)
+*   **Orchestration**: [LangChain](https://www.langchain.com/) & [LangGraph](https://langchain-ai.github.io/langgraph/)
+*   **Vector Engine**: [ChromaDB](https://www.trychroma.com/)
+*   **Inference**: [Groq Cloud](https://groq.com/) (Llama 3.3 70B / Mixtral 8x7B)
+*   **Vision**: Tesseract OCR for scanned PDF processing
+
+---
+
+## 📂 Project Architecture
 
 ```text
 university_kb/
-├── app.py                     # Main UI (Entry point)
-├── data/                      # Source documents, user profiles, and logs
+├── app.py                      # Main UI Hub & Dashboard
 ├── src/
-│   ├── student_agent.py       # LangGraph stateful student logic
-│   ├── admin_agent.py         # Robust tool-calling admin agent
-│   ├── chroma_store.py        # Vector database management
-│   ├── retriever.py           # Personalized search engine
-│   └── services/              # Profile, Report, Audit services
-└── tests/                     # Verification scripts
+│   ├── admin_agent.py          # AI Audit & Ingestion Logic
+│   ├── ai_classifier.py        # Automated Metadata Extraction
+│   ├── chroma_store.py         # Persistent Vector Database API
+│   ├── student_agent.py        # LangGraph Stateful Chat Logic
+│   └── schemas.py              # Unified Data Models
+├── data/                       # Local Logs & Contributor Metadata
+└── secure_storage/             # PII-Stripped Document Records
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🏁 Quick Start
 
-### 1. Prerequisites
-*   Python 3.10+
-*   Tesseract OCR (Optional, for scanned PDFs)
+### 1. Requirements
+Ensure you have Python installed and [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) for scanned document support.
 
-### 2. Installation
+### 2. Setup Environment
 ```bash
-# Clone and enter directory
-cd university_kb
-
-# Setup virtual environment
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-source .venv/bin/activate  # macOS/Linux
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Environment Configuration
-Create a `.env` file in the root based on `.env.example`:
+### 3. Configure `.env`
 ```env
-GROQ_API_KEY=gsk_...        # Required for Chatbot/Agent
-ADMIN_SECRET=university     # Key to access Admin Panel
-TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe  # For OCR
+GROQ_API_KEY=gsk_your_key_here
+ADMIN_SECRET=your_admin_secret
+TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe
 ```
 
-### 4. Preparation & Launch
+### 4. Launch
 ```bash
-# Generate sample data (Optional)
-python generate_sample_data.py
-
-# Launch the platform
 streamlit run app.py
 ```
 
 ---
 
-## 🖥️ User Roles
-
-### **Students**
-- **Login**: Enter any Student ID (e.g., `STU123`).
-- **Personalize**: Set interests in the sidebar to re-rank search results.
-- **Chat**: Use the "Campus Chatbot" for natural language queries about policies.
-
-### **Administrators**
-- **Login**: Use the `ADMIN_SECRET` defined in your `.env`.
-- **Manage**: Upload docs, edit metadata, or sweep for duplicates via the dashboard.
-- **Automate**: Use the **Admin AI Agent** to perform complex clean-up tasks via chat.
+## 📝 Governance Flow
+1. **Submit**: Contributors upload files; AI generates an **Audit Report**.
+2. **Pending**: Files are ingested into the "Shadow Queue" with `pending` status.
+3. **Review**: Admins inspect the AI audit findings in the **Approval Queue**.
+4. **Publish**: Approval flips the document to `active`, making it instantly searchable by the student chatbot.
 
 ---
-
-## 🛠️ Tech Stack
-*   **Framework**: [Streamlit](https://streamlit.io/)
-*   **LLM Orchestration**: [LangChain](https://www.langchain.com/) & [LangGraph](https://langchain-ai.github.io/langgraph/)
-*   **Vector Store**: [ChromaDB](https://www.trychroma.com/)
-*   **Model Provider**: [Groq](https://groq.com/) (Llama 3.3 70B & Mixtral 8x7B)
-
----
-
-## 📝 License
-MIT License - Developed for **Modernizing University Knowledge Base**.
+*Developed for UKB - Modernizing University Knowledge Engagement.*

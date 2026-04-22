@@ -47,6 +47,7 @@ class DocMetadata(BaseModel):
     verification_time: Optional[str] = Field(None, description="ISO-8601 timestamp of verification")
     is_archived: bool = Field(False, description="Deprecated in favor of 'status'")
     quality_score: float = Field(1.0, description="Data quality score (0.0-1.0)")
+    priority: Literal["high", "medium", "low"] = Field("medium", description="Document priority")
     audit_report: Optional[str] = Field(None, description="AI-generated audit summary for contributors")
     parent_doc_id: Optional[str] = Field(None, description="Reference to parent doc (for versioning/dedup)")
     
@@ -60,6 +61,24 @@ class DocMetadata(BaseModel):
         self.topic = self.topic.lower().strip().replace(" ", "_")
         self.department = self.department.upper().strip()
         return self
+
+    def to_chroma_dict(self) -> dict:
+        """Flatten for ChromaDB storage (converting bools to int, etc)."""
+        data = self.model_dump()
+        # Convert types Chroma might struggle with (depending on version)
+        # though modern Chroma is better, flat and simple is safer.
+        flat = {}
+        for k, v in data.items():
+            if isinstance(v, bool):
+                flat[k] = int(v)
+            elif v is None:
+                flat[k] = ""
+            elif isinstance(v, (list, dict)):
+                import json
+                flat[k] = json.dumps(v)
+            else:
+                flat[k] = v
+        return flat
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +140,7 @@ class SearchFilter(BaseModel):
     status: Optional[str] = None
     is_archived: Optional[bool] = None
     verification_status: Optional[str] = None
+    priority: Optional[str] = None
 
     def to_where_clause(self) -> Optional[dict]:
         """Convert to a ChromaDB $and where clause; returns None if no filters."""
@@ -143,6 +163,8 @@ class SearchFilter(BaseModel):
             conditions.append({"is_archived": {"$eq": self.is_archived}})
         if self.verification_status:
             conditions.append({"verification_status": {"$eq": self.verification_status}})
+        if self.priority:
+            conditions.append({"priority": {"$eq": self.priority}})
 
         if not conditions:
             return None

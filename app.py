@@ -38,6 +38,7 @@ from src.retriever import UniversityRetriever
 from src.schemas import DocMetadata, SearchFilter
 from src.utils import suggest_metadata_from_filename
 from src.student_agent import StudentAgent
+from src.ai_classifier import classify_uploaded_file
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -504,16 +505,70 @@ st.markdown(
     }
     .empty-state-body { font-size: 0.83rem; line-height: 1.6; }
 
-    /* ── Danger Zone ──────────────────────────────────────────────────── */
-    .danger-banner {
-        background: rgba(244,63,94,0.07);
-        border: 1px solid rgba(244,63,94,0.2);
+    /* ── Welcome Dashboard ────────────────────────────────────────────── */
+    .welcome-container {
+        padding: 40px;
+        background: rgba(201,168,76,0.03);
+        border: 1px solid rgba(201,168,76,0.1);
+        border-radius: var(--radius-lg);
+        margin: 20px 0 40px 0;
+    }
+    .welcome-greeting {
+        font-family: var(--font-display);
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: var(--accent-gold);
+        margin-bottom: 8px;
+    }
+    .welcome-subtext {
+        font-size: 1rem;
+        color: var(--text-muted);
+        margin-bottom: 30px;
+    }
+    .dashboard-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 20px;
+    }
+    .dashboard-card {
+        padding: 24px;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .dashboard-card:hover {
+        transform: translateY(-4px);
+        border-color: var(--accent-gold);
+    }
+    .card-icon { font-size: 2rem; margin-bottom: 12px; }
+    .card-title { font-weight: 700; font-size: 1.1rem; margin-bottom: 8px; }
+    .card-desc { font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; }
+
+    /* ── Clickable Suggestion Chips ────────────────────────────────────── */
+    .suggestion-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 20px 0;
+    }
+    .suggestion-chip {
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-light);
         border-radius: var(--radius-sm);
-        padding: 12px 16px;
-        font-size: 0.83rem;
-        color: #f87295;
-        font-family: var(--font-body);
-        margin-bottom: 16px;
+        padding: 10px 18px;
+        font-size: 0.88rem;
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: all 0.2s ease;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .suggestion-chip:hover {
+        border-color: var(--accent-gold);
+        background: rgba(201,168,76,0.05);
+        transform: translateY(-2px);
     }
 
     /* ── Example Prompts ──────────────────────────────────────────────── */
@@ -670,44 +725,75 @@ with st.sidebar:
         )
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
-
-    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
     
     # ── Student Contributor Login ────────────────────────────────────────
+    # ── Role Selection: Exclusive Locking ──
+    is_admin = st.session_state.get("is_admin", False)
+    is_contributor = st.session_state.get("is_contributor", False)
+
+    # 1. Student Contributor Section
     st.markdown(
         '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
         'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Student Contributor</div>',
         unsafe_allow_html=True,
     )
     
-    s_roll = st.text_input("Enter Roll Number to contribute", key="student_gate")
+    # Disable if Admin is active
+    s_disabled = is_admin
+    s_roll = st.text_input(
+        "Enter Roll Number to contribute", 
+        key="student_gate", 
+        disabled=s_disabled,
+        help="Login as Student Contributor. Mutually exclusive with Admin role."
+    )
+    
     if s_roll:
         if len(s_roll) >= 4:
             st.session_state.is_contributor = True
             st.session_state.contributor_id = s_roll
+            # Forcibly log out Admin
+            st.session_state.is_admin = False
             st.success(f"✓ Contributor: {s_roll}")
         else:
             st.error("✕ Invalid Roll Number")
             st.session_state.is_contributor = False
+    
+    if is_admin:
+        st.info("🔒 Student access locked while Admin is active.")
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
     
+    # 2. Admin Authentication Section
     st.markdown(
         '<div style="font-size:0.75rem;font-weight:600;color:var(--text-muted);'
         'text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Admin Authentication</div>',
         unsafe_allow_html=True,
     )
     
+    # Disable if Student Contributor is active
+    a_disabled = is_contributor
     admin_secret = os.getenv("ADMIN_SECRET", "admin123")
-    user_secret = st.text_input("Enter Secret to unlock Admin features", type="password", key="admin_gate")
+    user_secret = st.text_input(
+        "Enter Secret to unlock Admin features", 
+        type="password", 
+        key="admin_gate", 
+        disabled=a_disabled,
+        help="Login as Admin. Mutually exclusive with Student role."
+    )
     
     if user_secret == admin_secret:
         st.session_state.is_admin = True
+        # Forcibly log out Student
+        st.session_state.is_contributor = False
+        st.session_state.contributor_id = None
         st.success("✓ Admin Unlocked")
     else:
         st.session_state.is_admin = False
         if user_secret:
             st.error("✕ Invalid Secret")
+
+    if is_contributor:
+        st.info("🔒 Admin access locked while Contributor is active.")
 
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
 
@@ -750,6 +836,37 @@ st.markdown(
             <span class="hero-pill">LangChain</span>
             <span class="hero-pill">Streamlit</span>
             <span class="hero-pill">Groq LLM</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ── Welcome Dashboard ────────────────────────────────────────────────────────
+st.markdown(
+    f"""
+    <div class="welcome-container">
+        <div class="welcome-greeting">👋 Welcome to University KB</div>
+        <p class="welcome-subtext">
+            Your intelligent repository for campus policies, handbooks, and documents. 
+            Follow the paths below to get started.
+        </p>
+        <div class="dashboard-grid">
+            <div class="dashboard-card">
+                <div class="card-icon">🎓</div>
+                <div class="card-title">Students</div>
+                <div class="card-desc">Search campus policies and circulars using natural language.</div>
+            </div>
+            <div class="dashboard-card">
+                <div class="card-icon">🗳️</div>
+                <div class="card-title">Contributors</div>
+                <div class="card-desc">Enter your roll number in the sidebar, then upload documents for AI review.</div>
+            </div>
+            <div class="dashboard-card">
+                <div class="card-icon">🛠️</div>
+                <div class="card-title">Admins</div>
+                <div class="card-desc">Use the admin secret to unlock ingestion, approvals, and AI agent tools.</div>
+            </div>
         </div>
     </div>
     """,
@@ -814,6 +931,30 @@ with tab_student:
         with f2: f_dept = st.selectbox("Department", all_depts, key="s_dept")
         with f3: f_year = st.selectbox("Year", all_years, key="s_year")
 
+    # ── Try Asking (Suggestion Chips) ───────────────────────────────────
+    st.markdown('<div class="section-caption" style="margin-top:24px; margin-bottom:8px;">TRY ASKING</div>', unsafe_allow_html=True)
+    
+    # Use columns for a grid of 2x2 clickable chips
+    sq1, sq2 = st.columns(2)
+    suggestions = [
+        ("📜 What are the exam attendance rules?", "What are the exam attendance rules?"),
+        ("📘 What is the fee structure for CSE?", "What is the fee structure for CSE?"),
+        ("🗓️ What were the 2023 circular updates?", "What were the 2023 circular updates?"),
+        ("🎓 What documents are required for graduation?", "What documents are required for graduation?"),
+    ]
+    
+    suggestion_clicked = None
+    with sq1:
+        if st.button(suggestions[0][0], key="suggest_1", use_container_width=True):
+            suggestion_clicked = suggestions[0][1]
+        if st.button(suggestions[2][0], key="suggest_3", use_container_width=True):
+            suggestion_clicked = suggestions[2][1]
+    with sq2:
+        if st.button(suggestions[1][0], key="suggest_2", use_container_width=True):
+            suggestion_clicked = suggestions[1][1]
+        if st.button(suggestions[3][0], key="suggest_4", use_container_width=True):
+            suggestion_clicked = suggestions[3][1]
+
     # ── Chat Logic ──────────────────────────────────────────────────────
     if "student_messages" not in st.session_state:
         st.session_state.student_messages = []
@@ -829,7 +970,13 @@ with tab_student:
                         st.caption(chunk.content[:400] + "...")
 
     # Chat Input
-    if user_query := st.chat_input("Ask about rules, policies, or campus life..."):
+    user_query = st.chat_input("Ask about rules, policies, or campus life...")
+    
+    # If a suggestion was clicked, override user_query
+    if suggestion_clicked:
+        user_query = suggestion_clicked
+
+    if user_query:
         st.session_state.student_messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.markdown(user_query)
@@ -891,11 +1038,35 @@ if tab_contributor:
         
         c_file = st.file_uploader("Upload Document for Review", type=["pdf", "docx"], key="cont_upload")
         
-        c_topic = st.text_input("Short Topic Name (e.g. 'exam_rules')", key="cont_topic")
-        c_dept = st.text_input("Department", value="GENERAL", key="cont_dept")
-        c_year = st.number_input("Year", min_value=2000, max_value=2100, value=datetime.now().year, key="cont_year")
+        # --- AI Auto-Classification logic ---
+        if c_file:
+            if "last_cont_file" not in st.session_state or st.session_state.last_cont_file != c_file.name:
+                with st.spinner("🧠 AI is analyzing document content for metadata..."):
+                    ai_meta = classify_uploaded_file(c_file)
+                    st.session_state.cont_ai_meta = ai_meta
+                    st.session_state.last_cont_file = c_file.name
+                    
+                    # Directly update input keys to force-refresh the UI
+                    st.session_state.cont_topic = ai_meta.get("topic", "")
+                    st.session_state.cont_dept = ai_meta.get("department", "GENERAL")
+                    if ai_meta.get("year") and ai_meta.get("year") > 0:
+                        st.session_state.cont_year = ai_meta.get("year")
+                    st.session_state.cont_priority = ai_meta.get("priority", "medium")
+                    
+                    st.toast(f"AI suggested metadata for {c_file.name}")
+
+        ai_m = st.session_state.get("cont_ai_meta", {})
+        
+        c_topic = st.text_input("Short Topic Name (e.g. 'exam_rules')", value=ai_m.get("topic", ""), key="cont_topic")
+        c_dept = st.text_input("Department", value=ai_m.get("department", "GENERAL"), key="cont_dept")
+        c_year = st.number_input("Year", min_value=2000, max_value=2100, value=ai_m.get("year") if ai_m.get("year") and ai_m.get("year") > 0 else datetime.now().year, key="cont_year")
+        c_priority = st.selectbox("Priority", options=["high", "medium", "low"], index=["high", "medium", "low"].index(ai_m.get("priority", "medium")), key="cont_priority")
         
         if c_file and c_topic:
+            # Show AI Summary if available
+            if ai_m.get("overall_summary"):
+                st.info(f"📝 **AI Summary:** {ai_m['overall_summary']}")
+            
             with st.spinner("AI is auditing your submission..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=Path(c_file.name).suffix) as tmp:
                     tmp.write(c_file.read())
@@ -911,16 +1082,24 @@ if tab_contributor:
                         "topic": c_topic,
                         "department": c_dept,
                         "year": c_year,
+                        "priority": c_priority,
                         "contributor_id": st.session_state.contributor_id,
                         "status": "archived",
                         "verification_status": "pending",
                         "audit_report": audit_report,
-                        "quality_score": 0.8 # Initial score
+                        "quality_score": ai_m.get("topic_confidence", 0.8) # Use AI confidence
                     }
                     res = get_agent().upsert_doc(tmp_path, metadata)
                     os.unlink(tmp_path)
-                    st.success("✅ Submitted! Your document is now in the admin review queue.")
-                    st.cache_resource.clear()
+                    
+                    if "🚫" in res or "❌" in res:
+                        st.error(f"Upload Blocked by Integrity Guardrails:\n\n{res}")
+                    else:
+                        st.success("✅ Submitted! Your document is now in the admin review queue.")
+                        st.cache_resource.clear()
+                        # Reset contributor inputs
+                        st.session_state.last_cont_file = None
+                        st.rerun()
 
 if tab_admin:
     with tab_admin:
@@ -977,16 +1156,35 @@ if tab_admin:
                 help="Supported formats: PDF, DOCX, HTML",
             )
 
-            suggested = {}
             if uploaded_file:
-                suggested = suggest_metadata_from_filename(uploaded_file.name)
+                if "last_admin_file" not in st.session_state or st.session_state.last_admin_file != uploaded_file.name:
+                    with st.spinner("🧠 AI is analyzing document content for metadata..."):
+                        ai_meta = classify_uploaded_file(uploaded_file)
+                        st.session_state.admin_ai_meta = ai_meta
+                        st.session_state.last_admin_file = uploaded_file.name
+                        
+                        # Force update session state keys for Admin inputs
+                        st.session_state.ingest_topic = ai_meta.get("topic", "")
+                        st.session_state.ingest_dept = ai_meta.get("department", "GENERAL")
+                        if ai_meta.get("year") and ai_meta.get("year") > 2000:
+                            st.session_state.ingest_year = ai_meta.get("year")
+                        st.session_state.ingest_priority = ai_meta.get("priority", "medium")
+                        st.session_state.ingest_doc_type = ai_meta.get("doc_type", "other")
+                        
+                        st.toast(f"AI suggested metadata for {uploaded_file.name}")
+                
+                suggested = st.session_state.get("admin_ai_meta", {})
+                if not suggested:
+                     suggested = suggest_metadata_from_filename(uploaded_file.name)
+            else:
+                suggested = {}
 
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             m_doc_type = st.selectbox(
                 "Doc Type",
-                ["handbook", "circular", "policy", "other"],
-                index=["handbook", "circular", "policy", "other"].index(
+                ["handbook", "circular", "policy", "poster", "attendance", "certificate", "event", "other"],
+                index=["handbook", "circular", "policy", "poster", "attendance", "certificate", "event", "other"].index(
                     suggested.get("doc_type", "other")
                 ),
                 key="ingest_doc_type",
@@ -1001,6 +1199,12 @@ if tab_admin:
                 min_value=2000, max_value=2100,
                 value=suggested_year,
                 key="ingest_year",
+            )
+            m_priority = st.selectbox(
+                "Priority",
+                options=["high", "medium", "low"],
+                index=["high", "medium", "low"].index(suggested.get("priority", "medium")),
+                key="ingest_priority"
             )
         with col_m2:
             m_dept = st.text_input(
@@ -1019,6 +1223,8 @@ if tab_admin:
                 value=suggested.get("version", "1.0"),
                 key="ingest_version",
             )
+            if suggested.get("overall_summary"):
+                st.info(f"📝 **AI Summary:** {suggested['overall_summary']}")
         m_section = st.text_input("Section (optional)", key="ingest_section")
         m_effective = st.date_input("Effective Date", value=datetime.now(), key="ingest_effective")
 
@@ -1062,6 +1268,7 @@ if tab_admin:
                         "year": m_year,
                         "department": m_dept,
                         "access": m_access,
+                        "priority": m_priority,
                         "version": m_version,
                         "section": m_section,
                         "effective_date": m_effective.isoformat(),
@@ -1104,13 +1311,15 @@ if tab_admin:
                 # Batch Metadata Template
                 with st.container():
                     st.markdown("##### 🛠️ Batch Metadata Template")
+                    use_ai_bulk = st.checkbox("🧠 Use AI to auto-detect metadata for each file individually", value=True, key="bulk_use_ai")
+                    
                     col_b1, col_b2 = st.columns(2)
                     with col_b1:
-                        b_doc_type = st.selectbox("Doc Type", ["handbook", "circular", "policy", "other"], key="bulk_doc_type")
-                        b_year = st.number_input("Year", min_value=2000, max_value=2100, value=datetime.now().year, key="bulk_year")
+                        b_doc_type = st.selectbox("Doc Type", ["handbook", "circular", "policy", "poster", "attendance", "certificate", "event", "other"], key="bulk_doc_type", disabled=use_ai_bulk)
+                        b_year = st.number_input("Year", min_value=2000, max_value=2100, value=datetime.now().year, key="bulk_year", disabled=use_ai_bulk)
                     with col_b2:
-                        b_dept = st.text_input("Department", value="GENERAL", key="bulk_dept")
-                        b_access = st.selectbox("Access", ["public", "internal"], key="bulk_access")
+                        b_dept = st.text_input("Department", value="GENERAL", key="bulk_dept", disabled=use_ai_bulk)
+                        b_access = st.selectbox("Access", ["public", "internal"], key="bulk_access", disabled=use_ai_bulk)
                     
                     b_version = st.text_input("Version", value="1.0", key="bulk_version")
                     b_effective = st.date_input("Effective Date", value=datetime.now(), key="bulk_effective")
@@ -1121,42 +1330,69 @@ if tab_admin:
                     
                     # Prepare temporary files
                     temp_paths = []
-                    for f in bulk_files:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.name).suffix) as tmp:
-                            tmp.write(f.read())
-                            temp_paths.append(tmp.name)
-                            files_to_process.append({
-                                "path": tmp.name,
-                                "metadata": {
-                                    "source_file": f.name,
-                                    "doc_type": b_doc_type,
-                                    "year": b_year,
-                                    "department": b_dept,
-                                    "access": b_access,
-                                    "version": b_version,
-                                    "effective_date": b_effective.isoformat(),
-                                }
-                            })
-
-                    # Actual Processing Loop with st.status
-                    with st.status("🛠️ Processing Batch...", expanded=True) as status:
-                        st.write("Initializing ingestion job...")
+                    progress_text = "Analyzing files with AI..." if use_ai_bulk else "Preparing files..."
+                    with st.status(f"🛠️ {progress_text}", expanded=True) as status:
+                        for f in bulk_files:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.name).suffix) as tmp:
+                                tmp.write(f.read())
+                                tmp_path = tmp.name
+                                temp_paths.append(tmp_path)
+                                
+                                if use_ai_bulk:
+                                    st.write(f"🧠 AI Classifying `{f.name}`...")
+                                    ai_results = classify_uploaded_file(f)
+                                    metadata = {
+                                        "source_file": f.name,
+                                        "doc_type": ai_results.get("doc_type", "other"),
+                                        "year": ai_results.get("year", b_year),
+                                        "department": ai_results.get("department", b_dept),
+                                        "topic": ai_results.get("topic", "general"),
+                                        "access": ai_results.get("access", b_access),
+                                        "priority": ai_results.get("priority", "medium"),
+                                        "version": b_version,
+                                        "effective_date": b_effective.isoformat(),
+                                        "quality_score": ai_results.get("topic_confidence", 0.8)
+                                    }
+                                else:
+                                    metadata = {
+                                        "source_file": f.name,
+                                        "doc_type": b_doc_type,
+                                        "year": b_year,
+                                        "department": b_dept,
+                                        "access": b_access,
+                                        "priority": "medium",
+                                        "version": b_version,
+                                        "effective_date": b_effective.isoformat(),
+                                    }
+                                
+                                files_to_process.append({
+                                    "path": tmp_path,
+                                    "metadata": metadata
+                                })
                         
-                        # We use the internal _bulk_ingest logic but step-by-step for UI progress
-                        from src.admin_agent import _bulk_ingest
+                        st.write("🚀 Initializing ingestion job...")
                         
-                        # Instead of calling the full _bulk_ingest at once, we'll iterate here
-                        # to show live progress in the UI.
-                        report = agent.bulk_ingest(files_to_process, job_id)
+                        # Use the NEW generator-based bulk ingestion for real-time progress
+                        progress_bar = st.progress(0, text="Starting ingestion...")
                         
-                        for detail in report.file_details:
-                            if detail.status == "success":
-                                st.write(f"✅ {detail.filename}: Ingested {detail.chunks} chunks.")
-                            elif detail.status == "unsupported":
-                                st.write(f"⚠️ {detail.filename}: Unsupported format.")
-                            else:
-                                st.write(f"❌ {detail.filename}: Failed - {detail.error}")
+                        final_report = None
+                        for count, detail, current_report in agent.bulk_ingest_gen(files_to_process, job_id):
+                            # Update progress bar
+                            percent = count / len(files_to_process)
+                            progress_bar.progress(percent, text=f"Processing file {count}/{len(files_to_process)}")
+                            
+                            # Show detail if it's a file completion
+                            if detail:
+                                if detail.status == "success":
+                                    st.write(f"✅ {detail.filename}: Ingested {detail.chunks} chunks.")
+                                elif detail.status == "unsupported":
+                                    st.write(f"⚠️ {detail.filename}: Unsupported format.")
+                                else:
+                                    st.write(f"❌ {detail.filename}: Failed - {detail.error}")
+                            
+                            final_report = current_report
                         
+                        report = final_report
                         status.update(label="✅ Batch Ingestion Complete!", state="complete", expanded=False)
 
                     # Cleanup temp files
@@ -1318,20 +1554,21 @@ if tab_admin:
                         st.info(f"No history found for topic '{h_topic}'.")
                     else:
                         for doc in history:
-                            status_color = "#34d399" if doc.get("status") == "active" else "#94a3b8"
-                            if doc.get("status") == "obsolete": status_color = "#ef4444"
+                            v_status = doc.get("status") or "active"
+                            status_color = "#34d399" if v_status == "active" else "#94a3b8"
+                            if v_status == "obsolete": status_color = "#ef4444"
                             
                             with st.container():
                                 st.markdown(
                                     f'<div style="padding:15px; border:1px solid var(--border-subtle); '
                                     f'border-radius:8px; margin-bottom:10px; border-left:5px solid {status_color};">'
                                     f'<div style="display:flex; justify-content:space-between;">'
-                                    f'<strong>{doc.get("source_file")} (v{doc.get("version")})</strong>'
+                                    f'<strong>{doc.get("source_file", "Unknown")} (v{doc.get("version", "1.0")})</strong>'
                                     f'<span style="background:{status_color}; color:white; padding:2px 8px; '
-                                    f'border-radius:4px; font-size:0.7rem; font-weight:bold;">{doc.get("status").upper()}</span>'
+                                    f'border-radius:4px; font-size:0.7rem; font-weight:bold;">{v_status.upper()}</span>'
                                     f'</div>'
                                     f'<div style="font-size:0.8rem; color:var(--text-muted); margin-top:5px;">'
-                                    f'Effective: {doc.get("effective_date")} | Year: {doc.get("year")}</div>'
+                                    f'Effective: {doc.get("effective_date", "N/A")} | Year: {doc.get("year", "N/A")}</div>'
                                     f"</div>",
                                     unsafe_allow_html=True
                                 )
@@ -1359,26 +1596,27 @@ if tab_admin:
         with st.expander("📥  Pending Approvals Queue", expanded=True):
             st.caption("Review student submissions and AI audit reports.")
             
-            # Fetch pending chunks
-            all_meta = get_store().get_all_metadata()
-            pending = [m for m in all_meta if m.get("verification_status") == "pending"]
+            # Fetch pending chunks EFFICIENTLY
+            pending = get_store().get_pending_chunks()
             
             if not pending:
                 st.info("No pending submissions to review.")
             else:
-                # Unique source files
+                # Group by source file
                 pending_sources = {}
                 for m in pending:
-                    src = m.get("source_file")
+                    src = m.get("source_file", "unknown")
                     pending_sources.setdefault(src, []).append(m)
                     
                 for src, metas in pending_sources.items():
                     m = metas[0]
+                    # Get IDs for all chunks of this pending document
+                    # Important: Only target chunks that are ACTUALLY pending
                     with st.container():
                         st.markdown(
                             f'<div style="padding:15px; border:1px solid var(--border-subtle); border-radius:8px; margin-bottom:10px; border-left:5px solid #f59e0b;">'
                             f'<strong>{src}</strong> submitted by student <code>{m.get("contributor_id")}</code><br>'
-                            f'<span style="font-size:0.8rem; color:var(--text-muted);">Topic: {m.get("topic")} | Dept: {m.get("department")}</span>'
+                            f'<span style="font-size:0.8rem; color:var(--text-muted);">Topic: {m.get("topic")} | Dept: {m.get("department")} | Year: {m.get("year")}</span>'
                             f"</div>",
                             unsafe_allow_html=True
                         )
@@ -1387,28 +1625,61 @@ if tab_admin:
                             with st.expander("📄 View AI Audit Report"):
                                 st.info(m.get("audit_report"))
                         
-                        # Buttons
                         bq1, bq2, _ = st.columns([1, 1, 2])
                         with bq1:
                             if st.button("✅ Approve & Publish", key=f"appr_{src}"):
-                                # Update all chunks for this source
-                                res_all = get_store()._collection.get(where={"source_file": {"$eq": src}}, include=["metadatas"])
-                                ids = res_all["ids"]
-                                get_store().update_metadata(ids, {
-                                    "status": "active",
-                                    "verification_status": "verified",
-                                    "is_archived": False
-                                })
-                                st.success(f"Published {src}!")
-                                st.cache_resource.clear()
-                                st.rerun()
+                                with st.spinner("Publishing..."):
+                                    # Update metadata: change status to active and verified
+                                    # Target ONLY the chunks for this source that are pending
+                                    try:
+                                        store = get_store()
+                                        res_q = store._collection.get(
+                                            where={
+                                                "$and": [
+                                                    {"source_file": {"$eq": src}},
+                                                    {"verification_status": {"$eq": "pending"}}
+                                                ]
+                                            },
+                                            include=[]
+                                        )
+                                        target_ids = res_q.get("ids", [])
+                                        if target_ids:
+                                            store.update_metadata(target_ids, {
+                                                "status": "active",
+                                                "verification_status": "verified",
+                                                "is_archived": False
+                                            })
+                                            st.success(f"Published {src}!")
+                                            st.cache_resource.clear()
+                                            st.rerun()
+                                        else:
+                                            st.error("Could not locate pending chunks for this document.")
+                                    except Exception as e:
+                                        st.error(f"Approval failed: {e}")
                         with bq2:
                             if st.button("❌ Reject", key=f"rej_{src}"):
-                                res_all = get_store()._collection.get(where={"source_file": {"$eq": src}}, include=["metadatas"])
-                                get_store().delete_chunks(res_all["ids"])
-                                st.warning(f"Rejected and deleted {src}.")
-                                st.cache_resource.clear()
-                                st.rerun()
+                                with st.spinner("Deleting..."):
+                                    try:
+                                        store = get_store()
+                                        res_q = store._collection.get(
+                                            where={
+                                                "$and": [
+                                                    {"source_file": {"$eq": src}},
+                                                    {"verification_status": {"$eq": "pending"}}
+                                                ]
+                                            },
+                                            include=[]
+                                        )
+                                        target_ids = res_q.get("ids", [])
+                                        if target_ids:
+                                            store.delete_chunks(target_ids)
+                                            st.warning(f"Rejected and deleted {src}.")
+                                            st.cache_resource.clear()
+                                            st.rerun()
+                                        else:
+                                            st.error("Could not locate pending chunks for this document.")
+                                    except Exception as e:
+                                        st.error(f"Rejection failed: {e}")
         # ── H: Automated Deduplication Sweep ─────────────────────────────────
         with st.expander("🧹  Automated Deduplication Sweep", expanded=False):
             st.markdown(

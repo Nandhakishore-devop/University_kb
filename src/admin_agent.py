@@ -30,6 +30,260 @@ from src.utils import suggest_metadata_from_filename
 
 
 # ---------------------------------------------------------------------------
+# Integrity Guardrails Configuration
+# ---------------------------------------------------------------------------
+DUPLICATE_SIMILARITY_THRESHOLD = 0.95
+SIMILAR_TEXT_THRESHOLD = 0.85
+# ---------------------------------------------------------------------------
+
+
+
+def _check_exact_duplicate(store: ChromaStore, new_chunks: list) -> dict:
+    """
+    Check whether the document is a global duplicate of existing KB content.
+    Calculates a document-level similarity percentage.
+    """
+    if not new_chunks:
+        return {"blocked": False, "reason": "", "matches": []}
+
+    match_count = 0
+    matches = []
+    total_chunks = len(new_chunks)
+    
+    # We only check up to 20 chunks for performance on large docs
+    sample_size = min(total_chunks, 20)
+    step = max(1, total_chunks // sample_size)
+    sampled_chunks = new_chunks[::step][:sample_size]
+
+    for chunk in sampled_chunks:
+        content = chunk.get("text", "") if isinstance(chunk, dict) else (
+            getattr(chunk, "page_content", "") or getattr(chunk, "content", "")
+        )
+        if not content.strip():
+            continue
+
+        results = store.similarity_search(query=content, top_k=1, include_all_statuses=True)
+        if results and results[0].score >= DUPLICATE_SIMILARITY_THRESHOLD:
+            match_count += 1
+            top = results[0]
+            matches.append({
+                "source": top.metadata.get("source_file", "?"),
+                "score": round(top.score, 4),
+            })
+
+    if not matches:
+        return {"blocked": False, "reason": "", "matches": []}
+
+    # Document-level similarity percentage
+    similarity_pct = (match_count / len(sampled_chunks)) * 100
+    sources = list({m["source"] for m in matches})
+    
+    is_blocked = similarity_pct >= 75.0  # Block if >75% of content matches
+    
+    status_msg = "🚫 BLOCKED: Global Duplicate" if is_blocked else "⚠️ WARNING: Heavy Content Overlap"
+    reason = (
+        f"{status_msg} ({round(similarity_pct, 1)}% identical).\n"
+        f"This document is extremely similar to existing sources: {', '.join(sources)}.\n"
+    )
+    
+    if is_blocked:
+        reason += "Ingestion blocked to maintain KB integrity and prevent redundancy."
+    else:
+        reason += "Consider if this should be a new version instead of a new document."
+
+    return {"blocked": is_blocked, "reason": reason, "matches": matches, "similarity_pct": similarity_pct}
+
+
+def _check_similar_text(store: ChromaStore, new_chunks: list, source_file: str) -> dict:
+    """
+    Check whether the new document covers the same topic area as existing KB content.
+    """
+    if not new_chunks:
+        return {"blocked": False, "reason": "", "matches": [], "has_similar": False}
+
+    similar_hits: dict[str, float] = {}
+
+    for chunk in new_chunks:
+        content = chunk.get("text", "") if isinstance(chunk, dict) else (
+            getattr(chunk, "page_content", "") or getattr(chunk, "content", "")
+        )
+        if not content.strip():
+            continue
+
+        results = store.similarity_search(query=content, top_k=3, include_all_statuses=True)
+        for res in results:
+            src = res.metadata.get("source_file", "?")
+            if src == source_file:
+                continue
+            if SIMILAR_TEXT_THRESHOLD <= res.score < DUPLICATE_SIMILARITY_THRESHOLD:
+                if src not in similar_hits or res.score > similar_hits[src]:
+                    similar_hits[src] = res.score
+
+    if not similar_hits:
+        return {"blocked": False, "reason": "", "matches": [], "has_similar": False}
+
+    matches = [{"source": s, "max_score": round(v, 4)} for s, v in similar_hits.items()]
+    sources_str = ", ".join(
+        "'" + m["source"] + "' (" + str(round(m["max_score"] * 100, 1)) + "%)"
+        for m in matches
+    )
+    reason = (
+        "SIMILAR TOPIC DETECTED: The new document covers the same topic area as "
+        "existing KB sources: "
+        + sources_str
+        + ". Upload blocked to prevent topic overlap. "
+        "If this document contains updated information, use supersede_document_tool instead."
+    )
+    return {"blocked": True, "reason": reason, "matches": matches, "has_similar": True}
+
+
+def _check_contradictions(store: ChromaStore, new_chunks: list, metadata_dict: dict, api_key: str) -> dict:
+    """
+    Use an LLM to compare the new document's content against existing truth and flag contradictions.
+    """
+    if not api_key:
+        return {
+            "blocked": False,
+            "reason": "Contradiction check skipped (GROQ_API_KEY not set).",
+            "llm_report": "",
+        }
+
+    if not new_chunks:
+        return {"blocked": False, "reason": "", "llm_report": ""}
+
+    source_file = metadata_dict.get("source_file", "unknown")
+    topic = metadata_dict.get("topic", "")
+    dept = metadata_dict.get("department", "")
+
+    # Context collection: BROADEN SEARCH to catch cross-year/cross-dept conflicts
+    # 1. Search by topic + department
+    # 2. Search by key text snippets from new doc
+    new_text_sample = "\n\n".join([
+        c.get("text", "") if isinstance(c, dict) else (getattr(c, "page_content", "") or getattr(c, "content", ""))
+        for c in new_chunks[:10]
+    ])[:8000]
+
+    # Perform multiple global searches
+    search_queries = [topic, f"{dept} {topic}", new_text_sample[:150], new_text_sample[500:650]]
+    existing_results = []
+    seen_ids = set()
+
+    for q in search_queries:
+        if not q: continue
+        hits = store.similarity_search(query=q, top_k=5, include_all_statuses=True)
+        for h in hits:
+            # Skip current file if it's already in (unlikely in pre-ingest, but safe)
+            if h.metadata.get("source_file") == source_file:
+                continue
+            h_id = f"{h.metadata.get('source_file')}_{h.metadata.get('version')}_{h.content[:50]}"
+            if h_id not in seen_ids:
+                existing_results.append(h)
+                seen_ids.add(h_id)
+
+    if not existing_results:
+        return {"blocked": False, "reason": "No existing content to compare.", "llm_report": ""}
+
+    # Limit context size for LLM budget
+    existing_text = "\n\n".join([
+        f"--- SOURCE: {r.metadata.get('source_file')} (Dept: {r.metadata.get('department')} Year: {r.metadata.get('year')} v{r.metadata.get('version')}) --- \n{r.content}"
+        for r in existing_results[:12]
+    ])[:10000]
+
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import ChatPromptTemplate
+
+        llm = ChatOpenAI(
+            model=_get_groq_model(api_key),
+            temperature=0.0,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key,
+        )
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                "You are a University Knowledge Base Integrity Auditor.\n"
+                "Your goal is to detect DIRECT FACTUAL CONTRADICTIONS or NEAR-DUPLICATE Policies across years/departments.\n\n"
+                "RULES:\n"
+                "1. If a 2024 policy says 'Fee is $100' and a 2025 policy says 'Fee is $120', this is a CHRONOLOGICAL UPDATE, not a contradiction. Flag it as 'CHRONOLOGICAL_UPDATE'.\n"
+                "2. If two policies for the same year/context give different rules, flag as 'SEVERE_CONTRADICTION'.\n"
+                "3. If a new policy is 90% identical to an existing policy in another department but with minor changes, flag as 'CROSS_DEPARTMENT_REDUNDANCY'.\n\n"
+                "Respond ONLY with a JSON object: { \"has_issue\": bool, \"issue_type\": \"CONTRADICTION\"|\"REDUNDANCY\"|\"UPDATE\", \"severity\": \"HIGH\"|\"MEDIUM\"|\"LOW\", \"details\": [ { \"topic\": str, \"new_says\": str, \"existing_says\": str, \"target_source\": str } ], \"recommendation\": str }"
+            )),
+            ("human", f"NEW DOCUMENT (Target: {dept} {topic}):\n{new_text_sample}\n\nEXISTING GLOBAL KB CONTENT:\n{existing_text}"),
+        ])
+
+        response = llm.invoke(prompt.format_messages(new_text_sample=new_text_sample, existing_text=existing_text))
+        raw = response.content.strip()
+
+        # Simple json extraction
+        import re
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+             raw = match.group(0)
+        parsed = json.loads(raw)
+
+        has_issue = parsed.get("has_issue", False)
+        severity = parsed.get("severity", "LOW")
+        issue_type = parsed.get("issue_type", "NONE")
+        
+        # Blocking logic: Severe contradictions or High-severity redundancies block upload
+        should_block = has_issue and (severity == "HIGH" or (severity == "MEDIUM" and issue_type == "CONTRADICTION"))
+
+        if not has_issue:
+            reason = "Integrity scan clean."
+        else:
+            lines = [f"- [{d.get('target_source', '?')}] {d.get('topic', '?')}: {d.get('new_says', '?')} VS {d.get('existing_says', '?')}"
+                     for d in parsed.get("details", [])]
+            block_msg = "BLOCKED." if should_block else "WARNING."
+            reason = f"INTEGRITY {issue_type} (Severity: {severity}) — {block_msg}\n" + "\n".join(lines)
+
+        return {"blocked": should_block, "reason": reason, "llm_report": raw}
+
+    except Exception as e:
+        logger.error(f"Global Integrity Audit Exception: {e}")
+        return {"blocked": False, "reason": f"Audit error: {e}", "llm_report": ""}
+
+
+def _run_upload_guardrails(
+    store: ChromaStore,
+    new_chunks: list,
+    metadata_dict: dict,
+    api_key: str,
+) -> tuple[bool, str]:
+    """Sequence Pre-ingest integrity checks."""
+    source_file = metadata_dict.get("source_file", "unknown")
+    topic = metadata_dict.get("topic", "")
+
+    # 1. Exact Duplicate
+    dup = _check_exact_duplicate(store, new_chunks)
+    if dup["blocked"]:
+        return True, "🚫 [CHECK 1 – DUPLICATE DETECTED]\n" + dup["reason"]
+
+    # 2. Topic/Contradiction Audit
+    sim = _check_similar_text(store, new_chunks, source_file)
+    contra = _check_contradictions(store, new_chunks, metadata_dict, api_key)
+
+    if contra["blocked"]:
+        report = "🚫 [CHECK 3 – CONFLICT DETECTED]\n" + contra["reason"]
+        if sim["blocked"]:
+            report += "\n\nℹ️ [CHECK 2 – SIMILAR TOPIC context]\n" + sim["reason"]
+        return True, report
+
+    if sim["blocked"]:
+        return True, "🚫 [CHECK 2 – SIMILAR TOPIC DETECTED]\n" + sim["reason"]
+
+    # Warnings only
+    warnings = []
+    if sim.get("matches"):
+        warnings.append("⚠️ [CHECK 2 – TOPIC OVERLAP WARNING]\nBelow block threshold but review recommended.")
+    if contra.get("blocked") is False and "detected" in contra.get("reason", ""):
+         warnings.append("⚠️ [CHECK 3 – CONFLICT WARNING]\n" + contra["reason"])
+
+    if warnings:
+         return False, "⚠️ UPLOAD WARNINGS:\n\n" + "\n\n".join(warnings)
+
+    return False, ""
 
 
 def _bulk_ingest(
@@ -111,6 +365,106 @@ def _bulk_ingest(
     return report
 
 
+def _bulk_ingest_gen(
+    store: ChromaStore,
+    files_with_paths: list[dict], # List of {"path": str, "metadata": dict}
+    job_id: str
+):
+    """Process a batch of files and yield progress after each file."""
+    report = IngestionJobReport(
+        job_id=job_id,
+        start_time=datetime.now().isoformat(),
+        total_files=len(files_with_paths)
+    )
+
+    valid_extensions = [".pdf", ".docx", ".html", ".htm"]
+
+    for i, item in enumerate(files_with_paths):
+        file_path = item["path"]
+        metadata_dict = item["metadata"]
+        filename = metadata_dict.get("source_file", Path(file_path).name)
+        
+        detail = None
+        
+        # 1. Extension check
+        ext = Path(file_path).suffix.lower()
+        if ext not in valid_extensions:
+            report.unsupported_files += 1
+            detail = FileIngestionStatus(
+                filename=filename,
+                status="unsupported",
+                error=f"Format '{ext}' not supported."
+            )
+            report.file_details.append(detail)
+            report.processed_files += 1
+            yield (i + 1, detail, report)
+            continue
+
+        # 2. Ingest
+        try:
+            if "status" not in metadata_dict:
+                metadata_dict["status"] = "active"
+            if "verification_status" not in metadata_dict:
+                metadata_dict["verification_status"] = "verified"
+            
+            metadata = DocMetadata(**metadata_dict)
+            chunks = chunk_document(file_path, metadata)
+            
+            if not chunks:
+                report.failed_files += 1
+                detail = FileIngestionStatus(
+                    filename=filename,
+                    status="failed",
+                    error="No text extracted (may be empty or image-based PDF)"
+                )
+                report.file_details.append(detail)
+            else:
+                # RUN GUARDRAILS for Bulk Ingestion
+                api_key = os.getenv("GROQ_API_KEY", "")
+                is_blocked, guard_report = _run_upload_guardrails(store, chunks, metadata_dict, api_key)
+                
+                if is_blocked:
+                    report.failed_files += 1
+                    detail = FileIngestionStatus(
+                        filename=filename,
+                        status="failed",
+                        error=guard_report
+                    )
+                    report.file_details.append(detail)
+                    logger.warning(f"Bulk Guardrails: Blocked {filename}.\n{guard_report}")
+                else:
+                    n = store.upsert_chunks(chunks)
+                    report.successful_files += 1
+                    report.total_chunks += n
+                    detail = FileIngestionStatus(
+                        filename=filename,
+                        status="success",
+                        chunks=n
+                    )
+                    # If there was a warning but not blocked, append to detail or just log
+                    if guard_report:
+                        detail.error = guard_report # Use error field for warnings in UI
+                    
+                    report.file_details.append(detail)
+                    logger.info(f"Bulk Audit: {filename} ingested ({n} chunks)")
+
+        except Exception as e:
+            report.failed_files += 1
+            detail = FileIngestionStatus(
+                filename=filename,
+                status="failed",
+                error=str(e)
+            )
+            report.file_details.append(detail)
+            logger.error(f"Bulk Error processing {filename}: {e}")
+        
+        report.processed_files += 1
+        yield (i + 1, detail, report)
+
+    report.end_time = datetime.now().isoformat()
+    yield (len(files_with_paths), None, report)
+
+
 def _get_groq_model(api_key: str) -> str:
     """Get the Groq model to use.
     
@@ -159,20 +513,16 @@ def _upsert_doc(
     """Load, chunk, and upsert a document into ChromaDB."""
     try:
         # Default overrides for contributors vs admins
-        if "status" not in metadata_dict:
+        # ONLY apply defaults if the key is missing or specifically tells us to use defaults
+        if metadata_dict.get("status") is None:
             metadata_dict["status"] = "active"
-        if "verification_status" not in metadata_dict:
+        if metadata_dict.get("verification_status") is None:
             metadata_dict["verification_status"] = "verified"
             
+        # 1. First Pass: Metadata parsing
         metadata = DocMetadata(**metadata_dict)
         
-        # --- Automated Deduplication Warning ---
-        dup_summary = ""
-        if metadata.topic and metadata.department:
-            dup_msg = _detect_duplicates(store, metadata_dict)
-            if "NO_DUPLICATES" not in dup_msg:
-                dup_summary = f"\n\n⚠️ INGESTION WARNINGS (Potential Duplicates):\n{dup_msg}\n"
-
+        # 2. Chunk document to get text for guardrails
         chunks = chunk_document(file_path, metadata)
         if not chunks:
             file_ext = Path(file_path).suffix.lower()
@@ -180,30 +530,34 @@ def _upsert_doc(
                 return (
                     "❌ PDF Extraction Failed\n\n"
                     "This is a scanned/image-based PDF with no selectable text.\n\n"
-                    "✅ SOLUTION 1: Enable OCR (recommended)\n"
-                    "   - See OCR_SETUP.md for detailed instructions\n"
-                    "   - pip install pytesseract Pillow\n"
-                    "   - Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki\n"
-                    "   - Re-upload the PDF (automatic OCR will process it)\n\n"
-                    "✅ SOLUTION 2: Pre-convert the PDF\n"
-                    "   - Visit: https://www.ilovepdf.com/ocr_pdf\n"
-                    "   - Upload scanned PDF → Download OCR'd PDF\n"
-                    "   - Upload the converted PDF here\n\n"
-                    "✅ SOLUTION 3: Re-export PDF\n"
-                    "   - Open source document in original format\n"
-                    "   - Export/Print as PDF with text layer"
+                    "✅ SOLUTION: OCR might be required. Re-upload as a searchable text PDF."
                 )
             else:
-                return f"❌ ERROR: No text extracted from {Path(file_path).name}. The file may be empty or corrupted."
+                return f"❌ ERROR: No text extracted from {Path(file_path).name}. File may be empty."
+
+        # 3. RUN THE INTEGRITY GUARDRAILS
+        api_key = os.getenv("GROQ_API_KEY", "")
+        is_blocked, report = _run_upload_guardrails(store, chunks, metadata_dict, api_key)
         
+        if is_blocked:
+            # Audit log the blockage
+            logger.warning(f"Guardrails: Upload blocked for {metadata.source_file}.\n{report}")
+            return report
+
+        # 4. If not blocked, proceed to upsert
         n = store.upsert_chunks(chunks)
         
         # Audit logging
         logger.info(f"Audit: User {metadata.contributor_id} upserted {metadata.source_file}")
         
         success_msg = f"✅ SUCCESS: Upserted {n} chunks from '{Path(file_path).name}' (v{metadata.version})"
-        return success_msg + dup_summary
-
+        
+        # Surface any persistent warnings if allowed but flagged
+        if report:
+            return success_msg + f"\n\n{report}"
+        
+        return success_msg
+        
     except Exception as e:
         logger.error(f"upsert_doc_tool error: {e}")
         return f"❌ ERROR: {e}"
@@ -715,6 +1069,10 @@ class AdminAgent:
         """Process a batch of files and return a detailed report."""
         return _bulk_ingest(self._store, files_with_paths, job_id)
 
+    def bulk_ingest_gen(self, files_with_paths: list[dict], job_id: str):
+        """Yield progress during batch ingestion."""
+        return _bulk_ingest_gen(self._store, files_with_paths, job_id)
+
     def delete_by_metadata(self, filters: dict) -> str:
         return _delete_by_metadata(self._store, filters)
 
@@ -811,7 +1169,17 @@ class AdminAgent:
                     MessagesPlaceholder(variable_name="agent_scratchpad"),
                 ])
                 
-                agent_obj = create_tool_calling_agent(llm, self.tools, prompt)
+                # Try tool-calling agent (latest LangChain pattern)
+                try:
+                    from langchain.agents import create_openai_tools_agent as create_agent_func
+                except ImportError:
+                    try:
+                        from langchain.agents import create_tool_calling_agent as create_agent_func
+                    except ImportError:
+                        # Fallback for older 0.1.x versions
+                        from langchain.agents import create_openai_functions_agent as create_agent_func
+                
+                agent_obj = create_agent_func(llm, self.tools, prompt)
                 self._agent = AgentExecutor(agent=agent_obj, tools=self.tools, verbose=True)
                 logger.info("✅ LLM Admin Agent initialised (AgentExecutor mode)")
                 return self._agent

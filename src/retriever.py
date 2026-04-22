@@ -49,13 +49,21 @@ class UniversityRetriever:
         if not query.strip():
             return []
 
-        # Enforce public-only for students
+        # Enforce public-only and 'active' status for students
         if not admin_override:
             if filters is None:
-                filters = SearchFilter(access="public")
+                filters = SearchFilter(
+                    access="public", 
+                    status="active", 
+                    verification_status="verified"
+                )
             else:
-                # Clone with access forced to public
-                filters = filters.model_copy(update={"access": "public"})
+                # Clone with safety filters forced
+                filters = filters.model_copy(update={
+                    "access": "public",
+                    "status": "active",
+                    "verification_status": "verified"
+                })
 
         results = self._store.similarity_search(
             query=query,

@@ -171,8 +171,14 @@ class ChromaStore:
             logger.info("delete_by_filter: no matching chunks found")
             return 0
 
+        return self.delete_chunks(ids)
+
+    def delete_chunks(self, ids: List[str]) -> int:
+        """Directly delete chunks by their unique IDs."""
+        if not ids:
+            return 0
         self._collection.delete(ids=ids)
-        logger.info(f"Deleted {len(ids)} chunks matching filter {where}")
+        logger.info(f"Deleted {len(ids)} chunks by ID")
         return len(ids)
 
     # ------------------------------------------------------------------
@@ -184,18 +190,23 @@ class ChromaStore:
         query: str,
         search_filter: Optional[SearchFilter] = None,
         top_k: int = 5,
+        include_all_statuses: bool = False,
     ) -> List[ChunkRecord]:
         """Return top-k chunks most similar to query, with metadata & score.
         
-        Defaults to status='active' if no status is specified in filters.
+        Defaults to status='active' if no status is specified in filters,
+        unless include_all_statuses=True.
         """
-        if search_filter is None:
-            search_filter = SearchFilter(status="active")
-        elif search_filter.status is None and search_filter.is_archived is None:
-            # If specifically looking for something, but no status filter, default to active
-            search_filter.status = "active"
-
-        where = search_filter.to_where_clause() if search_filter else None
+        if include_all_statuses:
+            # Bypass default active filter
+            where = search_filter.to_where_clause() if search_filter else None
+        else:
+            if search_filter is None:
+                search_filter = SearchFilter(status="active")
+            elif search_filter.status is None and search_filter.is_archived is None:
+                # If specifically looking for something, but no status filter, default to active
+                search_filter.status = "active"
+            where = search_filter.to_where_clause()
 
         kwargs: dict = {
             "query_texts": [query],
@@ -257,6 +268,18 @@ class ChromaStore:
             return unique
         except Exception as e:
             logger.error(f"get_version_history failed: {e}")
+            return []
+
+    def get_pending_chunks(self) -> List[dict]:
+        """Efficiently fetch all chunks awaiting admin approval."""
+        try:
+            result = self._collection.get(
+                where={"verification_status": "pending"},
+                include=["metadatas"]
+            )
+            return result.get("metadatas", [])
+        except Exception as e:
+            logger.error(f"get_pending_chunks failed: {e}")
             return []
 
     def get_all_metadata(self, limit: int = 50_000) -> List[dict]:
